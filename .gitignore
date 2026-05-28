@@ -1,0 +1,8 @@
+/.venv
+/build
+/BUILD_GUIDE.md
+/deleted_files.txt
+/dist
+/ErazeHuman.spec
+/GETTING_STARTED.md
+/__pycache__
