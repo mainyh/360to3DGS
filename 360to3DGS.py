@@ -1,22 +1,30 @@
 """
-insta360_gs_extractor.py
+360to3DGS.py
 ────────────────────────────────────────────────────────────────────────────
 인스타360 360° 영상 → 가우시안 스플래팅용 멀티뷰 이미지 추출기
 
 원리
-  - 등장방형(equirectangular) 영상을 ffmpeg v360 필터로 flat 투영 분할
-  - Pitch × Yaw 격자를 좌상→우하 순서로 순회 (COLMAP이 선호하는 연속성)
-  - 인접 뷰 간 60~70% 중첩 → 특징점 매칭 품질 극대화
-  - 시간 간격: 장면 속도에 따라 자동 권장 / 수동 지정 가능
+    - 등장방형(equirectangular) 영상을 ffmpeg v360 필터로 flat 투영 분할
+    - Pitch × Yaw 격자를 좌상→우하 순서로 순회 (COLMAP이 선호하는 연속성)
+    - 인접 뷰 간 60~70% 중첩 → 특징점 매칭 품질 극대화
+    - 시간 간격: 장면 속도에 따라 자동 권장 / 수동 지정 가능
+
+변경사항 (최근)
+    - 파일명과 내부 설명을 `360to3DGS.py`로 통일
+    - 카메라 뒤편(촬영자 위치) 화각을 제외하는 옵션 `--exclude-back` 추가
+        (기본값: 0도, 비활성화). 전체 360도 추출을 기본으로 하며,
+        필요 시 특정 반경을 제외할 수 있습니다.
+    - 영상 시작점을 절대 시간으로 지정하는 `--start-time` 옵션 추가
+        (`--trim-start` 대신 직접 시작점을 지정하거나 함께 사용 가능)
 
 사용법
-  python insta360_gs_extractor.py <video.mp4> [옵션]
+    python 360to3DGS.py <video.mp4> [옵션]
 
 예시
-  python insta360_gs_extractor.py D:/Temp/skysplat-test1/footage.mp4
-  python insta360_gs_extractor.py footage.mp4 --interval 0.5 --fov 90 --out my_frames
-  python insta360_gs_extractor.py footage.mp4 --preset indoor
-  python insta360_gs_extractor.py footage.mp4 --no-time  # 각도 추출만, 시간 샘플링 없음
+    python 360to3DGS.py footage.mp4 --preset indoor
+    python 360to3DGS.py footage.mp4 --interval 0.5 --fov 90 --out my_frames
+    python 360to3DGS.py footage.mp4 --exclude-back 40 --start-time 10.0
+    python 360to3DGS.py footage.mp4 --no-time  # 각도 격자만 추출
 """
 
 import argparse
@@ -61,6 +69,8 @@ class ExtractionPlan:
     fov: float
     output_size: int
     views: List[ViewConfig] = field(default_factory=list)
+    exclude_back: float = 0.0
+    start_time: float = 0.0
 
     @property
     def total_images(self) -> int:
@@ -216,18 +226,28 @@ def probe_video(path: str) -> Tuple[float, float, int, int]:
 def compute_yaw_angles(fov: float, steps: int, overlap: float) -> List[float]:
     """
     중첩률을 고려한 yaw 각도 배열 생성.
-    step_angle = fov * (1 - overlap)
-    steps 수에 맞게 -180 ~ +180 내에서 균등 배치.
+    기본적으로는 step_angle = fov * (1 - overlap)을 사용하되,
+    yaw_steps 개수로 전체 360도를 커버하지 못하면 360/steps로 조정합니다.
     """
     step_angle = fov * (1.0 - overlap)
-    # 요청한 steps와 step_angle로 실제 커버 범위 계산
+    if step_angle <= 0.0:
+        step_angle = 360.0 / steps
+
     total_span = step_angle * steps
-    if total_span > 360:
-        # 360도를 steps로 나눠 재계산
+    if total_span != 360.0:
+        # yaw_steps 개수로 전체 360도 범위를 덮도록 보정
         step_angle = 360.0 / steps
 
     start = -180.0
     return [round(start + i * step_angle, 1) for i in range(steps)]
+
+
+def angular_distance(a: float, b: float) -> float:
+    """두 각도(도) 사이의 최소 차이(0~180)를 반환"""
+    d = abs(a - b) % 360.0
+    if d > 180.0:
+        d = 360.0 - d
+    return d
 
 
 def compute_pitch_angles(levels: int, pitch_range: Tuple[float, float]) -> List[float]:
@@ -327,26 +347,35 @@ def build_plan(args) -> ExtractionPlan:
         else:
             interval = preset.get("interval", recommend_interval(duration))
             print(f"      권장 간격: {interval}초 (프리셋 기반)")
+        # start-time이 지정되면 우선 사용 (절대 시작 지점)
+        trim_start = args.start_time if getattr(args, 'start_time', None) is not None else args.trim_start
         timestamps = build_timestamps(
             duration, interval,
-            trim_start=args.trim_start,
+            trim_start=trim_start,
             trim_end=args.trim_end,
         )
         print(f"      간격: {interval}초  →  {len(timestamps)}개 타임스탬프")
         print(f"      범위: {timestamps[0]:.2f}s ~ {timestamps[-1]:.2f}s")
 
-    total = len(timestamps) * len(pitches) * len(yaws)
-    print(f"\n      ★ 총 추출 이미지: {total}장")
-    if total > 3000:
+    preliminary_total = len(timestamps) * len(pitches) * len(yaws)
+    print(f"\n      ★ (초기 계산) 총 뷰 방향 수: {len(pitches) * len(yaws)}개 × {len(timestamps)}개 타임스탬프 = {preliminary_total}장")
+    if preliminary_total > 3000:
         print(f"  ⚠  3000장 초과! 시간 간격(--interval)을 늘리거나")
         print(f"     뷰 수(--yaw-steps, --pitch-levels)를 줄여보세요.")
 
     # ── 뷰 목록 조립 (좌상→우하 순서)
     views = []
     idx = 0
+    exclude_back = args.exclude_back if getattr(args, 'exclude_back', None) is not None else 0.0
+    exclude_center = args.exclude_center if getattr(args, 'exclude_center', None) is not None else 180.0
     for ts in timestamps:
         for r, pitch in enumerate(pitches):     # 위 → 아래
             for c, yaw in enumerate(yaws):      # 좌 → 우
+                # 촬영자(카메라 뒤편) 각도 제외 처리: 중심 180/-180 기준
+                if exclude_back and angular_distance(yaw, float(exclude_center)) <= float(exclude_back):
+                    # 제외 대상이므로 추가하지 않음
+                    continue
+
                 views.append(ViewConfig(
                     frame_index=idx,
                     timestamp=ts,
@@ -356,6 +385,10 @@ def build_plan(args) -> ExtractionPlan:
                     col=c,
                 ))
                 idx += 1
+
+    # 실제 뷰(제외 규칙 적용 후) 집계
+    final_total = len(views)
+    print(f"      ★ 실제 추출 이미지(제외 적용): {final_total}장\n")
 
     return ExtractionPlan(
         video_path=args.video,
@@ -368,6 +401,10 @@ def build_plan(args) -> ExtractionPlan:
         yaws=yaws,
         fov=fov,
         output_size=out_size,
+        exclude_back=exclude_back,
+        start_time=trim_start if not args.no_time else 0.0,
+        # 추가: 제외 중심도 저장
+        # 동적으로 DataClass에 필드를 추가하지 않고, 메타데이터에서 getattr으로 읽음
         views=views,
     )
 
@@ -376,11 +413,14 @@ def build_plan(args) -> ExtractionPlan:
 # ffmpeg 실행
 # ══════════════════════════════════════════════════════════════════════════════
 
-def extract_images(plan: ExtractionPlan, out_dir: Path, dry_run: bool = False):
+def extract_images(plan: ExtractionPlan, out_dir: Path, dry_run: bool = False, gpu: bool = False):
     out_dir.mkdir(parents=True, exist_ok=True)
 
     total = len(plan.views)
-    print(f"\n[4/4] 추출 시작 → {out_dir}")
+    if gpu:
+        print(f"\n[4/4] 추출 시작 (GPU 가속 활성화) → {out_dir}")
+    else:
+        print(f"\n[4/4] 추출 시작 → {out_dir}")
     print(f"      총 {total}장  (Ctrl+C 로 중단 가능)\n")
 
     errors = []
@@ -400,8 +440,13 @@ def extract_images(plan: ExtractionPlan, out_dir: Path, dry_run: bool = False):
             continue
 
         # ffmpeg 커맨드 조립
-        cmd = [
-            "ffmpeg",
+        cmd = ["ffmpeg"]
+        
+        # GPU 가속 옵션
+        if gpu:
+            cmd.extend(["-hwaccel", "cuda"])
+        
+        cmd.extend([
             "-ss", str(v.timestamp),    # 탐색 위치
             "-i", plan.video_path,
             "-vframes", "1",            # 1프레임만
@@ -418,7 +463,7 @@ def extract_images(plan: ExtractionPlan, out_dir: Path, dry_run: bool = False):
             str(out_path),
             "-loglevel", "error",
             "-y",
-        ]
+        ])
 
         progress = f"[{i:5d}/{total}] {v.timestamp:.2f}s P{v.pitch:+.0f}° Y{v.yaw:+.0f}°"
 
@@ -463,6 +508,9 @@ def export_metadata(plan: ExtractionPlan, out_dir: Path):
         "source_resolution": [plan.width, plan.height],
         "fov_deg": plan.fov,
         "output_size_px": plan.output_size,
+        "exclude_back_deg": plan.exclude_back,
+        "start_time_sec": plan.start_time,
+        "exclude_center_deg": getattr(plan, 'exclude_center', None),
         "pitch_angles": plan.pitches,
         "yaw_angles": plan.yaws,
         "timestamps": plan.timestamps,
@@ -505,10 +553,10 @@ def parse_args():
   fastmove  빠른 이동 촬영
 
 예시:
-  python insta360_gs_extractor.py footage.mp4
-  python insta360_gs_extractor.py footage.mp4 --preset indoor
-  python insta360_gs_extractor.py footage.mp4 --interval 0.5 --fov 90
-  python insta360_gs_extractor.py footage.mp4 --dry-run
+    python 360to3DGS.py footage.mp4
+    python 360to3DGS.py footage.mp4 --preset indoor
+    python 360to3DGS.py footage.mp4 --interval 0.5 --fov 90
+    python 360to3DGS.py footage.mp4 --dry-run
         """
     )
 
@@ -531,6 +579,8 @@ def parse_args():
         help="뒷부분 자르기(초, 기본 0.5)")
     parser.add_argument("--no-time", action="store_true",
         help="시간 축 샘플링 없이 0초만 사용 (각도 격자만 추출)")
+    parser.add_argument("--start-time", type=float, default=None,
+        help="영상 시작점(초). 지정 시 --trim-start보다 우선 적용")
 
     # 각도 옵션
     parser.add_argument("--fov", type=float, default=None,
@@ -544,10 +594,16 @@ def parse_args():
         help="피치 범위(°) ex) --pitch-range -30 30")
     parser.add_argument("--overlap", type=float, default=None,
         help="인접 뷰 중첩률 0~1 (기본: 프리셋, 권장 0.60~0.75)")
+    parser.add_argument("--exclude-back", type=float, default=0.0,
+        help="촬영자(카메라 뒤편) 화각 반경(도). 지정 각도 반경 이내 yaw는 추출하지 않음. 0으로 비활성화(기본)")
+    parser.add_argument("--exclude-center", type=float, default=180.0,
+        help="제외 중심 yaw(도). 기본 180 (카메라 뒤편). -180~180 범위")
 
     # 출력 옵션
     parser.add_argument("--size", type=int, default=None,
         help="출력 이미지 한 변 픽셀 (기본: 1024)")
+    parser.add_argument("--gpu", action="store_true",
+        help="NVIDIA GPU 가속 활성화 (CUDA, hwaccel cuda)")
     parser.add_argument("--ffmpeg", default=None,
         help="ffmpeg 실행 파일 전체 경로")
     parser.add_argument("--ffprobe", default=None,
@@ -584,7 +640,7 @@ def main():
         sys.exit(1)
 
     try:
-        extract_images(plan, out_dir, dry_run=args.dry_run)
+        extract_images(plan, out_dir, dry_run=args.dry_run, gpu=args.gpu)
     except FileNotFoundError as e:
         print(f"\n오류: {e}")
         sys.exit(1)
