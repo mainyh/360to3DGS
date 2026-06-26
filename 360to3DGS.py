@@ -81,57 +81,16 @@ class ExtractionPlan:
 # 프리셋 정의
 # ══════════════════════════════════════════════════════════════════════════════
 
-PRESETS = {
-    "outdoor": {
-        "description": "야외 넓은 공간 (건물 외관, 공원, 광장)",
-        "fov": 100,
-        "pitch_levels": 3,
-        "pitch_range": (-30, 30),
-        "yaw_steps": 12,
-        "interval": 1.0,
-        "output_size": 1024,
-        "overlap_target": 0.65,
-    },
-    "indoor": {
-        "description": "실내 공간 (방, 사무실, 카페)",
-        "fov": 90,
-        "pitch_levels": 3,
-        "pitch_range": (-25, 25),
-        "yaw_steps": 10,
-        "interval": 0.5,
-        "output_size": 1024,
-        "overlap_target": 0.70,
-    },
-    "landscape": {
-        "description": "경관 / 풍경 (산, 바다, 넓은 야외)",
-        "fov": 110,
-        "pitch_levels": 2,
-        "pitch_range": (-20, 20),
-        "yaw_steps": 8,
-        "interval": 2.0,
-        "output_size": 1024,
-        "overlap_target": 0.60,
-    },
-    "object": {
-        "description": "소형 오브젝트 촬영 (제품, 조각, 모형)",
-        "fov": 75,
-        "pitch_levels": 4,
-        "pitch_range": (-45, 45),
-        "yaw_steps": 16,
-        "interval": 0.3,
-        "output_size": 1024,
-        "overlap_target": 0.75,
-    },
-    "fastmove": {
-        "description": "빠른 이동 촬영 (드론, 달리기, 차량)",
-        "fov": 95,
-        "pitch_levels": 2,
-        "pitch_range": (-20, 15),
-        "yaw_steps": 10,
-        "interval": 0.25,
-        "output_size": 1024,
-        "overlap_target": 0.65,
-    },
+# 프리셋 제거: 기본값을 코드 내에 직접 사용합니다.
+DEFAULTS = {
+    "fov": 90,
+    "pitch_levels": 3,
+    "pitch_range": (-30, 30),
+    "yaw_steps": 12,
+    "interval": None,  # None이면 recommend_interval 사용
+    "output_size": 1024,
+    # 최소 중첩률: 0.85 (85%) 이상으로 강제
+    "min_overlap": 0.85,
 }
 
 
@@ -168,12 +127,20 @@ def resolve_executable(name: str, explicit_path: Optional[str] = None) -> str:
             f"환경 변수 {EXEC_ENV[name]}에 지정된 경로를 찾을 수 없습니다: {env_path}."
         )
 
-    path = shutil.which(name)
-    if path:
-        return path
+    which_path = shutil.which(name)
+    if which_path:
+        return which_path
 
+    # 추가 진단 정보 수집
+    path_env = os.environ.get("PATH", "")
+    debug_msg = (
+        f"필수 실행 파일을 찾을 수 없습니다: {name}.\n"
+        f"  shutil.which('{name}') -> {which_path!r}\n"
+        f"  환경변수 {EXEC_ENV[name]} -> {os.environ.get(EXEC_ENV[name])!r}\n"
+        f"  PATH -> {path_env[:1000]!r}"
+    )
     raise FileNotFoundError(
-        f"필수 실행 파일을 찾을 수 없습니다: {name}. "
+        debug_msg + "\n" +
         f"'{name}'를 설치하고 시스템 PATH에 추가하거나, 환경 변수 {EXEC_ENV[name]}를 설정하세요."
     )
 
@@ -196,16 +163,32 @@ def run(cmd: List[str], capture=True) -> subprocess.CompletedProcess:
 
 def probe_video(path: str) -> Tuple[float, float, int, int]:
     """ffprobe로 영상 메타데이터 추출 → (duration, fps, width, height)"""
-    probe = run([
+    cmd = [
         "ffprobe", "-v", "quiet",
         "-print_format", "json",
         "-show_streams", "-show_format",
         path
-    ])
+    ]
+    probe = run(cmd)
     if probe.returncode != 0:
-        raise RuntimeError(f"ffprobe 실패:\n{probe.stderr}")
+        # 상세 진단 정보 포함
+        raise RuntimeError(
+            "ffprobe 실패:\n"
+            f"  명령: {' '.join(cmd)}\n"
+            f"  종료코드: {probe.returncode}\n"
+            f"  stdout: {probe.stdout.strip()!r}\n"
+            f"  stderr: {probe.stderr.strip()!r}\n"
+        )
 
-    info = json.loads(probe.stdout)
+    try:
+        info = json.loads(probe.stdout)
+    except Exception as e:
+        raise RuntimeError(
+            "ffprobe 출력 파싱 실패:\n"
+            f"  명령: {' '.join(cmd)}\n"
+            f"  stdout(요약): {probe.stdout.strip()[:400]!r}\n"
+            f"  stderr: {probe.stderr.strip()!r}\n"
+            f"  파서 오류: {e}") from e
     video_stream = next(
         s for s in info["streams"] if s.get("codec_type") == "video"
     )
@@ -310,25 +293,29 @@ def build_plan(args) -> ExtractionPlan:
         print("  ⚠  가로:세로 비율이 2:1이 아닙니다.")
         print("     인스타360 원본 등장방형 영상인지 확인하세요.")
 
-    # ── 프리셋 적용
-    preset = PRESETS.get(args.preset, PRESETS["outdoor"])
-    if args.preset:
-        print(f"\n[2/4] 프리셋 적용: [{args.preset}] {preset['description']}")
+    # ── 기본값 적용 (프리셋 제거)
+    fov = args.fov or DEFAULTS["fov"]
+    pitch_levels = args.pitch_levels or DEFAULTS["pitch_levels"]
+    pitch_lo = args.pitch_range[0] if args.pitch_range else DEFAULTS["pitch_range"][0]
+    pitch_hi = args.pitch_range[1] if args.pitch_range else DEFAULTS["pitch_range"][1]
+    yaw_steps = args.yaw_steps or DEFAULTS["yaw_steps"]
+    out_size = args.size or DEFAULTS["output_size"]
 
-    fov         = args.fov          or preset["fov"]
-    pitch_levels = args.pitch_levels or preset["pitch_levels"]
-    pitch_lo    = args.pitch_range[0] if args.pitch_range else preset["pitch_range"][0]
-    pitch_hi    = args.pitch_range[1] if args.pitch_range else preset["pitch_range"][1]
-    yaw_steps   = args.yaw_steps    or preset["yaw_steps"]
-    overlap     = args.overlap      or preset["overlap_target"]
-    out_size    = args.size         or preset["output_size"]
+    # 중복률(overlap)은 사용자 지정값이 있어도 최소값을 보장함
+    requested_overlap = args.overlap if getattr(args, 'overlap', None) is not None else None
+    if requested_overlap is None:
+        overlap = DEFAULTS["min_overlap"]
+    else:
+        overlap = min(max(requested_overlap, DEFAULTS["min_overlap"]), 1.0)
+        if overlap != requested_overlap:
+            print(f"      중첩률이 최소 {DEFAULTS['min_overlap']*100:.0f}%로 강제됩니다. 입력값 {requested_overlap} → 사용값 {overlap}")
 
     # ── 각도 배열 계산
     print(f"\n[2/4] 뷰 격자 계산")
     pitches = compute_pitch_angles(pitch_levels, (pitch_lo, pitch_hi))
-    yaws    = compute_yaw_angles(fov, yaw_steps, overlap)
+    yaws = compute_yaw_angles(fov, yaw_steps, overlap)
 
-    yaw_step    = abs(yaws[1] - yaws[0]) if len(yaws) > 1 else fov
+    yaw_step = abs(yaws[1] - yaws[0]) if len(yaws) > 1 else fov
     actual_overlap = estimate_overlap(fov, yaw_step)
 
     print(f"      FOV: {fov}°  출력: {out_size}×{out_size}px")
@@ -345,8 +332,8 @@ def build_plan(args) -> ExtractionPlan:
         if args.interval:
             interval = args.interval
         else:
-            interval = preset.get("interval", recommend_interval(duration))
-            print(f"      권장 간격: {interval}초 (프리셋 기반)")
+            interval = recommend_interval(duration)
+            print(f"      권장 간격: {interval}초 (자동 권장)")
         # start-time이 지정되면 우선 사용 (절대 시작 지점)
         trim_start = args.start_time if getattr(args, 'start_time', None) is not None else args.trim_start
         timestamps = build_timestamps(
@@ -544,35 +531,25 @@ def parse_args():
     parser = argparse.ArgumentParser(
         description="인스타360 영상 → 가우시안 스플래팅용 멀티뷰 이미지 추출",
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-프리셋 목록:
-  outdoor   야외 넓은 공간 (기본값)
-  indoor    실내 공간
-  landscape 경관/풍경
-  object    소형 오브젝트
-  fastmove  빠른 이동 촬영
-
+                epilog="""
 예시:
-    python 360to3DGS.py footage.mp4
-    python 360to3DGS.py footage.mp4 --preset indoor
-    python 360to3DGS.py footage.mp4 --interval 0.5 --fov 90
-    python 360to3DGS.py footage.mp4 --dry-run
-        """
+        python 360to3DGS.py footage.mp4
+        python 360to3DGS.py footage.mp4 --interval 0.5 --fov 90
+        python 360to3DGS.py footage.mp4 --dry-run
+                """
     )
 
     parser.add_argument("video",
         help="입력 MP4 경로")
 
-    parser.add_argument("--preset", default="outdoor",
-        choices=list(PRESETS.keys()),
-        help="촬영 환경 프리셋 (기본: outdoor)")
+    # 프리셋 제거: 더 이상 지원하지 않음
 
     parser.add_argument("--out", default=None,
         help="출력 폴더 (기본: <영상이름>_GS_Frames)")
 
     # 시간 옵션
     parser.add_argument("--interval", type=float, default=None,
-        help="시간 샘플링 간격(초). 미지정시 프리셋 값 사용")
+        help="시간 샘플링 간격(초). 미지정시 자동 권장값 사용")
     parser.add_argument("--trim-start", type=float, default=0.5,
         help="앞부분 자르기(초, 기본 0.5)")
     parser.add_argument("--trim-end", type=float, default=0.5,
@@ -584,16 +561,16 @@ def parse_args():
 
     # 각도 옵션
     parser.add_argument("--fov", type=float, default=None,
-        help="수평/수직 FOV 각도(°, 기본: 프리셋)")
+        help="수평/수직 FOV 각도(°, 기본: 내장값)")
     parser.add_argument("--yaw-steps", type=int, default=None,
-        help="수평 분할 수 (기본: 프리셋)")
+        help="수평 분할 수 (기본: 내장값)")
     parser.add_argument("--pitch-levels", type=int, default=None,
-        help="수직 분할 수 (기본: 프리셋)")
+        help="수직 분할 수 (기본: 내장값)")
     parser.add_argument("--pitch-range", type=float, nargs=2,
         metavar=("LO", "HI"), default=None,
         help="피치 범위(°) ex) --pitch-range -30 30")
     parser.add_argument("--overlap", type=float, default=None,
-        help="인접 뷰 중첩률 0~1 (기본: 프리셋, 권장 0.60~0.75)")
+        help="인접 뷰 중첩률 0~1 (기본: 최소 0.85, 권장 0.85~0.90). 입력값이 0.85 미만이면 0.85로 보정됩니다.")
     parser.add_argument("--exclude-back", type=float, default=0.0,
         help="촬영자(카메라 뒤편) 화각 반경(도). 지정 각도 반경 이내 yaw는 추출하지 않음. 0으로 비활성화(기본)")
     parser.add_argument("--exclude-center", type=float, default=180.0,
