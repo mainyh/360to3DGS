@@ -143,14 +143,17 @@ def inspect_video_sample(video_path: str) -> dict:
         extract_sample_frame(video_path, sample_path, time_offset=0.5)
         img = cv2.imread(str(sample_path))
         if img is None:
-            return {"width": 0, "height": 0, "aspect": 0.0, "is_equirectangular": False}
+            return {"width": 0, "height": 0, "aspect": 0.0, "is_equirectangular": False, "is_smartphone": False}
         h, w = img.shape[:2]
         aspect = float(w) / float(h)
+        is_equirect = abs(aspect - 2.0) < 0.12
+        is_phone = (w, h) in [(1920, 1080), (1080, 1920), (1440, 2560), (2560, 1440), (3840, 2160), (2160, 3840)]
         return {
             "width": w,
             "height": h,
             "aspect": aspect,
-            "is_equirectangular": abs(aspect - 2.0) < 0.12,
+            "is_equirectangular": is_equirect,
+            "is_smartphone": is_phone,
         }
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
@@ -460,6 +463,10 @@ def run_colmap_pipeline(out_dir: Path, images_dir: Path, masks_dir: Path, db_pat
                     focal = cam["params"][0]
                     camera_angle_x = 2.0 * np.arctan2(cam["width"] / 2.0, focal)
                     camera_angle_y = 2.0 * np.arctan2(cam["height"] / 2.0, focal)
+                elif cam["model"] in ["OPENCV", "OPENCV_FISHEYE"] and cam["params"]:
+                    focal = cam["params"][0]
+                    camera_angle_x = 2.0 * np.arctan2(cam["width"] / 2.0, focal)
+                    camera_angle_y = 2.0 * np.arctan2(cam["height"] / 2.0, focal)
                 else:
                     camera_angle_x = 1.0
                     camera_angle_y = 1.0
@@ -544,7 +551,8 @@ def main():
         print(f"    해상도: {width}x{height}  fps: {info['r_frame_rate']}  길이: {duration:.2f}s")
 
         sample_info = inspect_video_sample(video_path)
-        print(f"    샘플 프레임: {sample_info['width']}x{sample_info['height']} aspect={sample_info['aspect']:.2f}")
+        phone_note = " (스마트폰 영상 감지)" if sample_info.get("is_smartphone") else ""
+        print(f"    샘플 프레임: {sample_info['width']}x{sample_info['height']} aspect={sample_info['aspect']:.2f}{phone_note}")
 
         if args.mode == "auto":
             if is_equirectangular(info, sample_info):
