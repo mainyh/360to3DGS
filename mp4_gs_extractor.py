@@ -24,6 +24,7 @@ COLMAP/3DGS용 이미지 추출과 사람 마스킹을 지원합니다.
 
 import argparse
 import json
+import math
 import os
 import subprocess
 import sys
@@ -191,13 +192,24 @@ def recommend_interval(duration: float) -> float:
     return round(max(0.5, min(3.0, interval)), 2)
 
 
-def extract_normal_frames(video_path: str, out_dir: Path, timestamps, out_w: int, out_h: int):
+def extract_normal_frames(video_path: str, out_dir: Path, timestamps, out_w: int, out_h: int, keep_aspect: bool = True):
     out_dir.mkdir(parents=True, exist_ok=True)
     extracted = []
     for idx, ts in enumerate(timestamps, 1):
         fname = f"T{ts:07.3f}.jpg"
         out_path = out_dir / fname
-        vf = f"scale={out_w}:{out_h}" if out_w and out_h else None
+        if out_w and out_h:
+            if keep_aspect:
+                # 가로(out_w)를 기준으로 비율을 유지하면서 스케일하고, 세로는
+                # 원본 비율에 맞춰 자동 계산한다(-2 = 짝수로 보정, 코덱 요구사항).
+                # out_h는 무시되지만(원본 비율이 우선), 이렇게 해야 좌우/상하로
+                # 눌리는 왜곡 없이 모든 프레임이 동일한 비율로 일관되게 나온다.
+                vf = f"scale={out_w}:-2"
+            else:
+                # 명시적으로 비율을 무시하고 정확히 out_w x out_h로 강제 (왜곡 발생 가능)
+                vf = f"scale={out_w}:{out_h}"
+        else:
+            vf = None
         cmd = [
             "ffmpeg", "-y",
             "-ss", str(ts),
@@ -212,13 +224,35 @@ def extract_normal_frames(video_path: str, out_dir: Path, timestamps, out_w: int
     return extracted
 
 
+def compute_square_pixel_fov(h_fov_deg: float, out_w: int, out_h: int) -> float:
+    """
+    h_fov(가로 시야각)를 기준으로, 출력 비율(out_h/out_w)에 맞는 v_fov를 계산.
+    f_x = (out_w/2) / tan(h_fov/2) 와 f_y = (out_h/2) / tan(v_fov/2) 가 같아지도록
+    (= 정사각형 픽셀, 왜곡 없음) v_fov를 역산한다.
+
+    h_fov=v_fov 로 같은 각도를 주고 out_w != out_h 인 경우, 가로/세로 픽셀 밀도가
+    달라져서 "좌우로 눌린" 형태로 찌그러지는 문제가 생긴다. 이 함수로 계산한
+    v_fov를 쓰면 f_x == f_y가 보장되어 왜곡이 없어진다.
+    """
+    half_h_fov_rad = math.radians(h_fov_deg / 2.0)
+    fx = (out_w / 2.0) / math.tan(half_h_fov_rad)
+    half_v_fov_rad = math.atan((out_h / 2.0) / fx)
+    return math.degrees(half_v_fov_rad) * 2.0
+
+
 def extract_view(video_path: str, out_dir: Path, yaw: float, pitch: float, fov: float, fps: int, out_w: int, out_h: int, tag: str):
     out_dir.mkdir(parents=True, exist_ok=True)
     pattern = str(out_dir / f"{tag}_%05d.jpg")
     yaw_norm = normalize_yaw(yaw)
+
+    # h_fov는 프리셋 값을 그대로 사용(가로 시야각 기준), v_fov는 출력 비율에 맞춰
+    # 자동 계산해서 정사각형 픽셀을 보장한다 (anamorphic 왜곡 방지).
+    h_fov = fov
+    v_fov = compute_square_pixel_fov(h_fov, out_w, out_h)
+
     vf = (
         f"v360=e:flat:yaw={yaw_norm}:pitch={pitch}:roll=0:"
-        f"h_fov={fov}:v_fov={fov}:w={out_w}:h={out_h},"
+        f"h_fov={h_fov}:v_fov={v_fov:.4f}:w={out_w}:h={out_h},"
         f"fps={fps}"
     )
     cmd = [
@@ -360,7 +394,7 @@ def prepare_colmap_inputs(images_dir: Path, masks_dir: Path, colmap_images_dir: 
     return image_paths
 
 
-def run_colmap_pipeline(out_dir: Path, images_dir: Path, masks_dir: Path, db_path: str, matcher: str = "sequential", prepare_brush: bool = False):
+def run_colmap_pipeline(out_dir: Path, images_dir: Path, masks_dir: Path, db_path: str, matcher: str = "sequential", prepare_brush: bool = False, vocab_tree_path: str = None):
     colmap_dir = out_dir / "colmap"
     colmap_images_dir = colmap_dir / "images"
     colmap_masks_dir = colmap_dir / "masks"
@@ -381,11 +415,22 @@ def run_colmap_pipeline(out_dir: Path, images_dir: Path, masks_dir: Path, db_pat
         feature_cmd += ["--ImageReader.mask_path", str(colmap_masks_dir)]
     run(feature_cmd)
 
-    match_cmd = [
-        "colmap",
-        f"{matcher}_matcher" if matcher != "sequential" else "sequential_matcher",
-        "--database_path", db_path,
-    ]
+    if matcher == "vocab_tree":
+        match_cmd = [
+            "colmap", "vocab_tree_matcher",
+            "--database_path", db_path,
+        ]
+        if vocab_tree_path:
+            match_cmd += ["--VocabTreeMatching.vocab_tree_path", vocab_tree_path]
+        # vocab_tree_path 미지정 시: 최신 COLMAP은 사전학습 트리를 자동 다운로드/캐싱함.
+        # 구버전이면 "vocab_tree_path를 지정해야 한다"는 에러가 날 수 있으니
+        # 그때는 --vocab-tree-path로 .bin 파일을 직접 지정해야 함.
+    else:
+        match_cmd = [
+            "colmap",
+            f"{matcher}_matcher",
+            "--database_path", db_path,
+        ]
     run(match_cmd)
 
     mapper_cmd = [
@@ -503,7 +548,9 @@ def main():
                     help="일반 MP4 추출 간격(초). 지정하지 않으면 권장값 사용")
     ap.add_argument("--start-time", type=float, default=0.0, help="추출 시작 시간(초)")
     ap.add_argument("--trim-end", type=float, default=0.0, help="끝에서 제외할 시간(초)")
-    ap.add_argument("--resize", default="1920x1080", help="출력 프레임 크기(WxH)")
+    ap.add_argument("--resize", default="1920x1080", help="출력 프레임 크기(WxH). --resize-mode fit이면 가로(W) 기준으로만 적용되고 세로는 비율유지 자동계산됨")
+    ap.add_argument("--resize-mode", choices=["fit", "stretch"], default="fit",
+                    help="fit(기본값): 비율 유지하며 스케일(왜곡 없음, 권장). stretch: 비율 무시하고 W x H로 강제(왜곡 발생 가능, 기존 동작)")
     ap.add_argument("--blur-thresh", type=float, default=15.0,
                     help="라플라시안 분산 임계값 이하 프레임 제외")
     ap.add_argument("--person-skip-ratio", type=float, default=0.35,
@@ -515,7 +562,11 @@ def main():
     ap.add_argument("--run-colmap", action="store_true", help="추출 후 COLMAP 정렬/매칭/매핑 및 Brush 전처리까지 자동 실행")
     ap.add_argument("--start-from-colmap", action="store_true", help="이미지 추출 없이 기존 images/ 폴더를 사용해서 COLMAP부터 시작")
     ap.add_argument("--colmap-db", default=None, help="COLMAP database 경로 (기본: <output>/database.db)")
-    ap.add_argument("--colmap-matcher", default="sequential", choices=["sequential", "exhaustive"], help="COLMAP matcher 종류")
+    ap.add_argument("--colmap-matcher", default="sequential", choices=["sequential", "exhaustive", "vocab_tree"], help="COLMAP matcher 종류")
+    ap.add_argument("--vocab-tree-path", default=None,
+                    help="vocab_tree matcher용 사전학습 vocabulary tree(.bin) 경로. "
+                         "지정 안 하면 최신 COLMAP은 자동 다운로드/캐싱을 시도함 "
+                         "(구버전 COLMAP은 에러나니 직접 다운받아 지정 필요).")
     ap.add_argument("--prepare-brush", action="store_true", help="COLMAP 이후 Brush 학습용 transforms.json 생성")
     args = ap.parse_args()
 
@@ -575,10 +626,15 @@ def main():
             print(f"[i] 일반 MP4 추출: interval={interval}s start={args.start_time}s trim_end={args.trim_end}s resize={out_w}x{out_h}")
             timestamps = build_timestamps(duration, interval, args.start_time, args.trim_end)
             print(f"[i] 타임스탬프 수: {len(timestamps)}")
-            all_raw_frames = extract_normal_frames(video_path, raw_dir, timestamps, out_w, out_h)
+            all_raw_frames = extract_normal_frames(
+                video_path, raw_dir, timestamps, out_w, out_h,
+                keep_aspect=(args.resize_mode == "fit"),
+            )
         else:
             preset = SCENE_PRESETS[args.preset]
+            computed_v_fov = compute_square_pixel_fov(preset["fov"], preset["out_w"], preset["out_h"])
             print(f"[i] 360 추출 프리셋 '{args.preset}' 적용: yaw {len(preset['yaw_list'])} x pitch {len(preset['pitch_list'])}")
+            print(f"    h_fov={preset['fov']}° -> 자동계산 v_fov={computed_v_fov:.2f}° (출력 {preset['out_w']}x{preset['out_h']}, 정사각형 픽셀 보장)")
             t0 = time.time()
             for yaw in preset["yaw_list"]:
                 for pitch in preset["pitch_list"]:
@@ -653,6 +709,7 @@ def main():
             "start_time": args.start_time,
             "trim_end": args.trim_end,
             "resize": args.resize,
+            "resize_mode": args.resize_mode,
         } if mode == "normal" else None,
         "masking_enabled": not args.no_mask,
         "blur_thresh": args.blur_thresh,
@@ -683,6 +740,7 @@ def main():
                 db_path,
                 matcher=args.colmap_matcher,
                 prepare_brush=args.prepare_brush or args.run_colmap,
+                vocab_tree_path=args.vocab_tree_path,
             )
             print(f"[i] COLMAP 파이프라인 완료. 결과: {colmap_result['colmap_dir']}")
         except FileNotFoundError:
