@@ -457,8 +457,8 @@ def run_colmap_pipeline(out_dir: Path, images_dir: Path, masks_dir: Path, db_pat
             if img_path.is_file():
                 shutil.copy2(img_path, brush_images_dir / img_path.name)
 
-        images_txt = sparse_dir / "0" / "images.txt"
-        cameras_txt = sparse_dir / "0" / "cameras.txt"
+        images_txt = export_dir / "images.txt"
+        cameras_txt = export_dir / "cameras.txt"
         if images_txt.exists() and cameras_txt.exists():
             cameras = {}
             with open(cameras_txt, "r", encoding="utf-8") as f:
