@@ -9,6 +9,7 @@ COLMAP/3DGS용 이미지 추출과 사람 마스킹을 지원합니다.
   python mp4_gs_extractor.py --input video.mp4 --output out_dir
   python mp4_gs_extractor.py --input video.mp4 --output out_dir --interval 1.5 --no-mask
   python mp4_gs_extractor.py --input video.mp4 --output out_dir --mode normal --run-colmap
+  python mp4_gs_extractor.py --input video.mp4 --output out_dir --start-from-brush  # Brush만 재시작
 
 기능:
   - 입력 MP4가 일반 영상인지 equirectangular(2:1)인지 자동 판별
@@ -28,6 +29,7 @@ import math
 import os
 import subprocess
 import sys
+import shlex
 import shutil
 import tempfile
 import time
@@ -128,6 +130,7 @@ def extract_sample_frame(video_path: str, out_path: Path, time_offset: float = 0
         "-ss", str(time_offset),
         "-i", video_path,
         "-frames:v", "1",
+        "-vf", "format=yuvj420p",
         "-q:v", "2",
         str(out_path),
         "-loglevel", "error",
@@ -210,6 +213,9 @@ def extract_normal_frames(video_path: str, out_dir: Path, timestamps, out_w: int
                 vf = f"scale={out_w}:{out_h}"
         else:
             vf = None
+        # mjpeg가 지원하지 않는 포맷(HDR 10bit, 4:2:2 등)의 프레임이 들어오는
+        # 것에 대비해 항상 mjpeg 호환 포맷으로 명시 변환한다.
+        vf = f"{vf},format=yuvj420p" if vf else "format=yuvj420p"
         cmd = [
             "ffmpeg", "-y",
             "-ss", str(ts),
@@ -219,7 +225,15 @@ def extract_normal_frames(video_path: str, out_dir: Path, timestamps, out_w: int
         if vf:
             cmd.extend(["-vf", vf])
         cmd.extend(["-q:v", "2", str(out_path), "-loglevel", "error"])
-        run(cmd, capture_output=True, text=True)
+        try:
+            run(cmd, capture_output=True, text=True)
+        except subprocess.CalledProcessError:
+            # 영상 끝부분 등 특정 타임스탬프에서만 디코딩/인코딩이 실패하는
+            # 경우가 있다(예: 컨테이너 duration이 실제 디코드 가능한 길이보다
+            # 길게 잡혀 있어 마지막 프레임 근처에서 시크가 빗나가는 경우).
+            # 프레임 하나 때문에 전체 추출이 중단되지 않도록 건너뛴다.
+            print(f"[!] t={ts}s 프레임 추출 실패, 건너뜁니다 ({idx}/{len(timestamps)})")
+            continue
         extracted.append(out_path)
     return extracted
 
@@ -253,7 +267,7 @@ def extract_view(video_path: str, out_dir: Path, yaw: float, pitch: float, fov: 
     vf = (
         f"v360=e:flat:yaw={yaw_norm}:pitch={pitch}:roll=0:"
         f"h_fov={h_fov}:v_fov={v_fov:.4f}:w={out_w}:h={out_h},"
-        f"fps={fps}"
+        f"fps={fps},format=yuvj420p"
     )
     cmd = [
         "ffmpeg", "-y",
@@ -536,6 +550,27 @@ def run_colmap_pipeline(out_dir: Path, images_dir: Path, masks_dir: Path, db_pat
     }
 
 
+def run_brush_training(dataset_dir: Path, brush_exe: str = "brush.exe", extra_args=None):
+    # Brush는 콜맵 스파스 포인트클라우드(sparse/*/points3D.*)가 있으면 거기서
+    # 가우시안을 초기화하고, 없으면(transforms.json만 있는 nerfstudio 포맷)
+    # 랜덤 초기화로 시작한다. 랜덤 초기화는 품질이 크게 떨어지므로, COLMAP
+    # 결과가 있다면 반드시 콜맵 네이티브 폴더(images/ + sparse/0/)를 넘겨야 한다.
+    has_colmap_points = any((dataset_dir / "sparse").glob("*/points3D.*")) if (dataset_dir / "sparse").exists() else False
+    has_transforms = (dataset_dir / "transforms.json").exists()
+    if not has_colmap_points and not has_transforms:
+        raise FileNotFoundError(
+            f"Brush 학습용 데이터셋을 찾을 수 없습니다: {dataset_dir} "
+            "(images/ + sparse/0/{cameras,images,points3D}.* 또는 transforms.json 필요. --run-colmap을 먼저 실행하세요)"
+        )
+    if not has_colmap_points:
+        print("[!] sparse/*/points3D.*가 없어 포인트클라우드 초기화 없이(랜덤 초기화) 학습합니다. "
+              "COLMAP 결과 폴더(images/ + sparse/0/)를 넘기면 품질이 크게 좋아집니다.")
+    cmd = [brush_exe, str(dataset_dir)]
+    if extra_args:
+        cmd.extend(extra_args)
+    run(cmd)
+
+
 def main():
     ap = argparse.ArgumentParser(description="MP4 영상에서 COLMAP/3DGS용 이미지 추출 + 사람 마스킹")
     ap.add_argument("--input", required=True, help="입력 MP4 영상 경로")
@@ -561,6 +596,8 @@ def main():
     ap.add_argument("--no-mask", action="store_true", help="사람 마스킹을 생략하고 블러 필터만 적용")
     ap.add_argument("--run-colmap", action="store_true", help="추출 후 COLMAP 정렬/매칭/매핑 및 Brush 전처리까지 자동 실행")
     ap.add_argument("--start-from-colmap", action="store_true", help="이미지 추출 없이 기존 images/ 폴더를 사용해서 COLMAP부터 시작")
+    ap.add_argument("--start-from-brush", action="store_true",
+                    help="이미지 추출/COLMAP 없이 기존 <output>/colmap/ 폴더(images/+sparse/0/)로 Brush 학습만 재시작")
     ap.add_argument("--colmap-db", default=None, help="COLMAP database 경로 (기본: <output>/database.db)")
     ap.add_argument("--colmap-matcher", default="sequential", choices=["sequential", "exhaustive", "vocab_tree"], help="COLMAP matcher 종류")
     ap.add_argument("--vocab-tree-path", default=None,
@@ -568,6 +605,12 @@ def main():
                          "지정 안 하면 최신 COLMAP은 자동 다운로드/캐싱을 시도함 "
                          "(구버전 COLMAP은 에러나니 직접 다운받아 지정 필요).")
     ap.add_argument("--prepare-brush", action="store_true", help="COLMAP 이후 Brush 학습용 transforms.json 생성")
+    ap.add_argument("--run-brush", action="store_true",
+                    help="COLMAP 완료 후 Brush 학습까지 자동 실행 (--prepare-brush 자동 적용)")
+    ap.add_argument("--brush-exe", default="brush.exe",
+                    help="Brush 학습 실행파일 경로/이름 (기본: brush.exe, PATH에 등록되어 있어야 함)")
+    ap.add_argument("--brush-args", default=None,
+                    help='Brush 실행 시 추가로 전달할 인자 문자열 (예: "--total-train-iters 30000 --export-every 5000")')
     args = ap.parse_args()
 
     video_path = args.input
@@ -576,6 +619,22 @@ def main():
     images_dir = out_dir / "images"
     masks_dir = out_dir / "masks"
     out_dir.mkdir(parents=True, exist_ok=True)
+
+    if args.start_from_brush:
+        print("[i] --start-from-brush: 이미지 추출/COLMAP 없이 기존 colmap/ 폴더로 Brush 학습만 재시작합니다.")
+        colmap_dir = out_dir / "colmap"
+        try:
+            brush_extra_args = shlex.split(args.brush_args) if args.brush_args else None
+            run_brush_training(colmap_dir, brush_exe=args.brush_exe, extra_args=brush_extra_args)
+            print("[i] Brush 학습 완료")
+        except FileNotFoundError as e:
+            print(f"[!] Brush 실행 준비 실패: {e}")
+            sys.exit(1)
+        except subprocess.CalledProcessError as e:
+            print(f"[!] Brush 학습 실행 실패: {e}")
+            sys.exit(1)
+        print("[OK] 완료")
+        return
 
     if not args.start_from_colmap and not Path(video_path).exists():
         print(f"[!] 입력 영상을 찾을 수 없습니다: {video_path}")
@@ -743,12 +802,24 @@ def main():
                 vocab_tree_path=args.vocab_tree_path,
             )
             print(f"[i] COLMAP 파이프라인 완료. 결과: {colmap_result['colmap_dir']}")
+            if args.run_brush:
+                try:
+                    brush_extra_args = shlex.split(args.brush_args) if args.brush_args else None
+                    # brush_dir(transforms.json)이 아니라 colmap_dir(images/+sparse/0/)을
+                    # 넘겨야 Brush가 COLMAP 포인트클라우드로 가우시안을 초기화한다.
+                    # transforms.json만 쓰면 랜덤 초기화로 시작해 품질이 크게 떨어진다.
+                    run_brush_training(Path(colmap_result["colmap_dir"]), brush_exe=args.brush_exe, extra_args=brush_extra_args)
+                    print("[i] Brush 학습 완료")
+                except FileNotFoundError as e:
+                    print(f"[!] Brush 실행 준비 실패: {e}")
+                except subprocess.CalledProcessError as e:
+                    print(f"[!] Brush 학습 실행 실패: {e}")
         except FileNotFoundError:
             print("[!] colmap 실행파일을 찾을 수 없습니다. PATH에 colmap이 등록되어 있는지 확인하세요.")
         except subprocess.CalledProcessError as e:
             print(f"[!] COLMAP 실행 실패: {e}")
 
-    print("[✓] 완료")
+    print("[OK] 완료")
 
 
 if __name__ == "__main__":
