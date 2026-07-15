@@ -52,6 +52,39 @@ except ImportError:
     print("[!] numpy 미설치. 설치: pip install numpy")
     np = None
 
+_LOG_FILE_PATH = None
+
+
+def set_log_file(path: Path) -> None:
+    """이후 log()로 남기는 모든 메시지를 이 파일에 남긴다. 같은 이름의 로그가 이미
+    있으면(예: 같은 출력 폴더에서 재실행) 거기에 이어 쓰지 않고, 파일명 뒤에
+    실행 시각(시분초)을 붙여 매 실행마다 새 로그 파일을 만든다 - 그래야 여러 번
+    돌린 로그가 한 파일에 섞여 어느 실행의 결과인지 헷갈리는 일이 없다."""
+    global _LOG_FILE_PATH
+    if path.exists():
+        path = path.with_name(f"{path.stem}_{time.strftime('%H%M%S')}{path.suffix}")
+    _LOG_FILE_PATH = path
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        # BOM 없는 UTF-8은 메모장 등 일부 Windows 편집기가 시스템 코드페이지
+        # (한글 Windows는 CP949)로 잘못 추정해 한글이 깨져 보인다. 새로 만드는
+        # 파일이므로 BOM을 한 번 남겨 UTF-8임을 명시한다.
+        with open(path, "wb") as f:
+            f.write(b"\xef\xbb\xbf")
+    except OSError:
+        pass
+
+
+def log(msg: str = "") -> None:
+    print(msg)
+    if _LOG_FILE_PATH is not None:
+        try:
+            with open(_LOG_FILE_PATH, "a", encoding="utf-8") as f:
+                f.write(msg + "\n")
+        except OSError:
+            pass
+
+
 SCENE_PRESETS = {
     "outdoor_wide": {
         "yaw_list": [0, 60, 120, 180, 240, 300],
@@ -91,16 +124,16 @@ PERSON_CLASS_ID = 0
 
 
 def run(cmd, **kwargs):
-    print(f"[cmd] {' '.join(str(c) for c in cmd)}")
+    log(f"[cmd] {' '.join(str(c) for c in cmd)}")
     try:
         return subprocess.run(cmd, check=True, **kwargs)
     except subprocess.CalledProcessError as e:
         if e.stdout:
-            print("---- stdout ----")
-            print(e.stdout if isinstance(e.stdout, str) else e.stdout.decode(errors="replace"))
+            log("---- stdout ----")
+            log(e.stdout if isinstance(e.stdout, str) else e.stdout.decode(errors="replace"))
         if e.stderr:
-            print("---- stderr ----")
-            print(e.stderr if isinstance(e.stderr, str) else e.stderr.decode(errors="replace"))
+            log("---- stderr ----")
+            log(e.stderr if isinstance(e.stderr, str) else e.stderr.decode(errors="replace"))
         raise
 
 
@@ -260,7 +293,14 @@ def extract_normal_frames(video_path: str, out_dir: Path, timestamps, out_w: int
             # 경우가 있다(예: 컨테이너 duration이 실제 디코드 가능한 길이보다
             # 길게 잡혀 있어 마지막 프레임 근처에서 시크가 빗나가는 경우).
             # 프레임 하나 때문에 전체 추출이 중단되지 않도록 건너뛴다.
-            print(f"[!] t={ts}s 프레임 추출 실패, 건너뜁니다 ({idx}/{len(timestamps)})")
+            log(f"[!] t={ts}s 프레임 추출 실패, 건너뜁니다 ({idx}/{len(timestamps)})")
+            continue
+        if not out_path.exists():
+            # ffmpeg는 위와 같은 시크 실패 상황에서도 종료 코드 0으로 끝나면서
+            # 프레임 파일을 전혀 만들지 않는 경우가 있다. 이때 out_path를 그대로
+            # extracted에 넣으면 이후 단계(rename/imread 등)가 존재하지 않는
+            # 파일을 참조하다 터진다.
+            log(f"[!] t={ts}s 프레임 파일이 생성되지 않음, 건너뜁니다 ({idx}/{len(timestamps)})")
             continue
         extracted.append(out_path)
     return extracted
@@ -370,7 +410,7 @@ def load_yolo_seg(model_name: str = "yolov8n-seg.pt"):
     try:
         from ultralytics import YOLO
     except ImportError:
-        print("[!] ultralytics 미설치. 설치: pip install ultralytics")
+        log("[!] ultralytics 미설치. 설치: pip install ultralytics")
         sys.exit(1)
     return YOLO(model_name)
 
@@ -405,10 +445,10 @@ def report_blur_stats(raw_frames):
             continue
         variances.append(laplacian_variance(img))
     if not variances:
-        print("[!] 읽을 수 있는 프레임이 없습니다.")
+        log("[!] 읽을 수 있는 프레임이 없습니다.")
         return []
     arr = np.array(variances)
-    print(f"[i] 블러 분산값 통계 (n={len(arr)}): min={arr.min():.1f}  p10={np.percentile(arr,10):.1f}  median={np.median(arr):.1f}  p90={np.percentile(arr,90):.1f}  max={arr.max():.1f}")
+    log(f"[i] 블러 분산값 통계 (n={len(arr)}): min={arr.min():.1f}  p10={np.percentile(arr,10):.1f}  median={np.median(arr):.1f}  p90={np.percentile(arr,90):.1f}  max={arr.max():.1f}")
     return variances
 
 
@@ -468,7 +508,7 @@ def prepare_colmap_inputs(images_dir: Path, masks_dir: Path, colmap_images_dir: 
     if not image_paths:
         raise FileNotFoundError(f"COLMAP 입력 이미지가 없습니다: {source_dir}")
     if source_dir != images_dir:
-        print(f"[i] 이미지 소스 디렉토리 자동 감지: {source_dir}")
+        log(f"[i] 이미지 소스 디렉토리 자동 감지: {source_dir}")
 
     index_map = {}
     for idx, img_path in enumerate(image_paths, start=1):
@@ -503,7 +543,12 @@ def count_registered_images(model_dir: Path) -> int:
     return 0
 
 
-def merge_sparse_models(sparse_dir: Path) -> Path:
+def _log_registration_ratio(label: str, count: int, total_images: int) -> None:
+    if total_images:
+        log(f"[i] {label}: {count}장 / 전체 {total_images}장 등록 ({count / total_images * 100:.1f}%)")
+
+
+def merge_sparse_models(sparse_dir: Path, total_images: int = None) -> Path:
     """colmap mapper는 씬이 완전히 연결되지 않으면 여러 개의 분리된 서브모델
     (sparse/0, sparse/1, ...)을 만든다. model_converter/Brush는 관례적으로
     sparse/0만 사용하는데, 그대로 두면 더 큰 재구성을 조용히 버리고 훨씬 빈약한
@@ -511,18 +556,20 @@ def merge_sparse_models(sparse_dir: Path) -> Path:
     나머지 모델들을 colmap model_merger로 하나씩 흡수 시도한다(공통으로 등록된
     이미지가 있어야 두 모델의 좌표계를 정합할 수 있음 - 공통 이미지가 없으면
     병합이 실패하는데, 이 경우 해당 모델은 버리지 않고 별도 번호로 보존한다).
-    최종적으로 가장 크게 합쳐진 모델을 sparse/0 자리에 둔다."""
+    최종적으로 가장 크게 합쳐진 모델을 sparse/0 자리에 둔다.
+    total_images가 주어지면 최종적으로 전체 입력 이미지 중 몇 %가 등록됐는지도 남긴다."""
     model_dirs = sorted([d for d in sparse_dir.iterdir() if d.is_dir()], key=lambda p: p.name)
     if not model_dirs:
         raise FileNotFoundError(f"COLMAP sparse 모델이 없습니다: {sparse_dir}")
 
     counts = {d: count_registered_images(d) for d in model_dirs}
     for d in model_dirs:
-        print(f"    sparse 모델 '{d.name}': 등록 이미지 {counts[d]}장")
+        log(f"    sparse 모델 '{d.name}': 등록 이미지 {counts[d]}장")
 
     ordered = sorted(model_dirs, key=lambda d: counts[d], reverse=True)
     zero_dir = sparse_dir / "0"
     if len(ordered) == 1:
+        _log_registration_ratio("최종 등록", counts[ordered[0]], total_images)
         return ordered[0]
 
     work_dir = sparse_dir / "_merge_work"
@@ -531,6 +578,7 @@ def merge_sparse_models(sparse_dir: Path) -> Path:
 
     current = work_dir / "current"
     shutil.copytree(ordered[0], current)
+    current_count = counts[ordered[0]]
     leftover_srcs = []
     for i, other in enumerate(ordered[1:]):
         merge_out = work_dir / f"attempt_{i}"
@@ -541,15 +589,33 @@ def merge_sparse_models(sparse_dir: Path) -> Path:
              "--output_path", str(merge_out)],
             capture_output=True, text=True,
         )
-        if result.returncode == 0 and merge_out.exists() and any(merge_out.iterdir()):
-            merged_count = count_registered_images(merge_out)
-            print(f"[i] sparse 모델 병합: '{other.name}'({counts[other]}장) 흡수 -> 누적 {merged_count}장")
+        # model_merger는 두 모델 간 공통 등록 이미지가 부족해 정합(alignment)에
+        # 실패해도 exit code 0을 반환하고 출력 폴더에 뭔가를 남길 수 있다. 그래서
+        # returncode/출력 존재 여부만으로는 실제 병합 성공 여부를 판단할 수 없다.
+        # colmap이 남기는 원본 진단 메시지를 그대로 기록해서 원인을 확인할 수 있게 한다.
+        log(f"---- colmap model_merger 출력 ('{other.name}' 흡수 시도) ----")
+        if result.stdout.strip():
+            log(result.stdout.rstrip())
+        if result.stderr.strip():
+            log(result.stderr.rstrip())
+
+        merge_ran = result.returncode == 0 and merge_out.exists() and any(merge_out.iterdir())
+        merged_count = count_registered_images(merge_out) if merge_ran else 0
+
+        # 진짜 병합이 됐다면 등록 이미지 수는 절대 줄어들 수 없다(정합 실패 시
+        # model_merger가 더 작은 결과를 낼 수 있음). 누적 장수보다 줄었다면
+        # 정합 실패로 간주해서 기존에 쌓아온 모델을 잃지 않도록 한다.
+        if merge_ran and merged_count >= current_count:
+            log(f"[i] sparse 모델 병합: '{other.name}'({counts[other]}장) 흡수 -> 누적 {merged_count}장")
             shutil.rmtree(current)
             current = merge_out
+            current_count = merged_count
         else:
             # 공통 등록 이미지가 없으면 model_merger가 정합을 못 해 실패한다.
             # 데이터를 버리지 않고 따로 보관해서 나중에 수동으로 참고할 수 있게 한다.
-            print(f"[!] sparse 모델 '{other.name}'({counts[other]}장)는 공통 등록 이미지가 없어 병합 실패 - 별도 보관")
+            log(f"[!] sparse 모델 '{other.name}'({counts[other]}장) 병합 실패"
+                f"(결과 {merged_count}장 < 누적 {current_count}장) - 공통 등록 이미지 부족으로 추정, 별도 보관")
+            shutil.rmtree(merge_out, ignore_errors=True)
             leftover_copy = work_dir / f"unmerged_src_{i}"
             shutil.copytree(other, leftover_copy)
             leftover_srcs.append(leftover_copy)
@@ -563,7 +629,8 @@ def merge_sparse_models(sparse_dir: Path) -> Path:
 
     shutil.rmtree(work_dir, ignore_errors=True)
     final_count = count_registered_images(zero_dir)
-    print(f"[i] 최종 병합 모델: {final_count}장 등록 (sparse/0)")
+    log(f"[i] 최종 병합 모델: {final_count}장 등록 (sparse/0)")
+    _log_registration_ratio("최종 등록", final_count, total_images)
     return zero_dir
 
 
@@ -577,7 +644,7 @@ def run_colmap_pipeline(out_dir: Path, images_dir: Path, masks_dir: Path, db_pat
 
     sparse_dir.mkdir(parents=True, exist_ok=True)
     prepare_colmap_inputs(images_dir, masks_dir, colmap_images_dir, colmap_masks_dir)
-    print(f"[i] COLMAP 입력 이미지 정렬 완료: {colmap_images_dir}")
+    log(f"[i] COLMAP 입력 이미지 정렬 완료: {colmap_images_dir}")
 
     feature_cmd = [
         "colmap", "feature_extractor",
@@ -622,7 +689,8 @@ def run_colmap_pipeline(out_dir: Path, images_dir: Path, masks_dir: Path, db_pat
     ]
     run(mapper_cmd)
 
-    best_model_dir = merge_sparse_models(sparse_dir)
+    total_images = sum(1 for p in colmap_images_dir.iterdir() if p.is_file())
+    best_model_dir = merge_sparse_models(sparse_dir, total_images=total_images)
 
     export_dir.mkdir(parents=True, exist_ok=True)
     converter_cmd = [
@@ -707,9 +775,9 @@ def run_colmap_pipeline(out_dir: Path, images_dir: Path, masks_dir: Path, db_pat
 
             with open(brush_dir / "transforms.json", "w", encoding="utf-8") as f:
                 json.dump({"frames": frames}, f, ensure_ascii=False, indent=2)
-            print(f"[i] Brush 전처리 완료: {brush_dir}")
+            log(f"[i] Brush 전처리 완료: {brush_dir}")
         else:
-            print("[!] COLMAP sparse 모델을 찾지 못해 Brush 전처리를 건너뜁니다.")
+            log("[!] COLMAP sparse 모델을 찾지 못해 Brush 전처리를 건너뜁니다.")
 
     return {
         "colmap_dir": str(colmap_dir),
@@ -732,7 +800,7 @@ def run_brush_training(dataset_dir: Path, brush_exe: str = "brush.exe", extra_ar
             "(images/ + sparse/0/{cameras,images,points3D}.* 또는 transforms.json 필요. --run-colmap을 먼저 실행하세요)"
         )
     if not has_colmap_points:
-        print("[!] sparse/*/points3D.*가 없어 포인트클라우드 초기화 없이(랜덤 초기화) 학습합니다. "
+        log("[!] sparse/*/points3D.*가 없어 포인트클라우드 초기화 없이(랜덤 초기화) 학습합니다. "
               "COLMAP 결과 폴더(images/ + sparse/0/)를 넘기면 품질이 크게 좋아집니다.")
     cmd = [brush_exe, str(dataset_dir)]
     if extra_args:
@@ -740,9 +808,223 @@ def run_brush_training(dataset_dir: Path, brush_exe: str = "brush.exe", extra_ar
     run(cmd)
 
 
+def process_single_video(video_path: str, args, raw_dir: Path, images_dir: Path, masks_dir: Path, filename_prefix: str = ""):
+    """영상 한 편에 대해 모드 판별 -> 프레임 추출 -> 블러 필터 + 사람 마스킹까지 수행하고
+    결과를 images_dir/masks_dir에 쌓는다. 같은 공간을 찍은 여러 영상을 하나의 COLMAP
+    재구성으로 합칠 때는 영상마다 다른 filename_prefix를 줘서 images_dir/masks_dir을
+    공유해도 파일명이 겹치지 않게 한다."""
+    log(f"[i] 영상 정보 확인 중... ({video_path})")
+    info = ffprobe_info(video_path)
+    width = int(info["width"])
+    height = int(info["height"])
+    duration = float(info.get("duration", 0.0))
+    aspect = float(width) / float(height)
+    log(f"    해상도: {width}x{height}  fps: {info['r_frame_rate']}  길이: {duration:.2f}s")
+
+    sample_info = inspect_video_sample(video_path)
+    phone_note = " (스마트폰 영상 감지)" if sample_info.get("is_smartphone") else ""
+    log(f"    샘플 프레임: {sample_info['width']}x{sample_info['height']} aspect={sample_info['aspect']:.2f}{phone_note}")
+
+    fov = fps = yaw_list = pitch_list = None
+    camera_model = None
+    camera_params = None
+
+    if args.mode == "auto":
+        if is_equirectangular(info, sample_info):
+            mode = "equirectangular"
+            log("[i] 자동 판별: 360°/equirectangular 영상으로 감지되어 360 추출 파이프라인을 사용합니다.")
+        else:
+            mode = "normal"
+            log("[i] 자동 판별: 일반 카메라 영상으로 감지되어 시간 간격 추출을 사용합니다.")
+    else:
+        mode = args.mode
+        log(f"[i] 강제 모드: {mode}")
+
+    raw_dir.mkdir(parents=True, exist_ok=True)
+    all_raw_frames = []
+    failed_views = []
+
+    if mode == "normal":
+        interval = args.interval if args.interval else recommend_interval(duration)
+        out_w, out_h = parse_resolution(args.resize)
+        log(f"[i] 일반 MP4 추출: interval={interval}s start={args.start_time}s trim_end={args.trim_end}s resize={out_w}x{out_h}")
+        timestamps = build_timestamps(duration, interval, args.start_time, args.trim_end)
+        log(f"[i] 타임스탬프 수: {len(timestamps)}")
+        all_raw_frames = extract_normal_frames(
+            video_path, raw_dir, timestamps, out_w, out_h,
+            keep_aspect=(args.resize_mode == "fit"),
+        )
+    else:
+        preset = SCENE_PRESETS[args.preset]
+        fov = args.fov if args.fov is not None else preset["fov"]
+        yaw_list = parse_float_list(args.yaw_list) if args.yaw_list else preset["yaw_list"]
+        pitch_list = parse_float_list(args.pitch_list) if args.pitch_list else preset["pitch_list"]
+        out_w, out_h = preset["out_w"], preset["out_h"]
+        num_views = len(yaw_list) * len(pitch_list)
+
+        computed_v_fov = compute_square_pixel_fov(fov, out_w, out_h)
+        log(f"[i] 360 추출 프리셋 '{args.preset}' 적용: yaw {len(yaw_list)} x pitch {len(pitch_list)} = {num_views}뷰")
+        log(f"    h_fov={fov}° -> 자동계산 v_fov={computed_v_fov:.2f}° (출력 {out_w}x{out_h}, 정사각형 픽셀 보장)")
+
+        if len(yaw_list) > 1:
+            # yaw_list가 360°를 균등 분할한다는 가정 하의 대략적인 추정치.
+            # (겹침 부족 = COLMAP이 인접 yaw끼리 매칭을 못 찾아 재구성이 끊길 위험)
+            yaw_step = 360.0 / len(yaw_list)
+            overlap_deg = fov - yaw_step
+            status = "양호" if overlap_deg > 15 else ("중첩 적음, 주의" if overlap_deg > 0 else "중첩 없음! 매칭 끊길 위험")
+            log(f"    yaw 간격 추정={yaw_step:.1f}° (fov={fov}° 기준) -> 인접 뷰 중첩 약 {overlap_deg:.1f}° ({status})")
+
+        end_time = max(0.0, duration - args.trim_end)
+        if args.start_time >= end_time:
+            log(f"[!] start_time({args.start_time}s) + trim_end({args.trim_end}s) >= 영상 길이({duration:.2f}s)입니다.")
+            sys.exit(1)
+        clip_duration = (end_time - args.start_time) if (args.start_time > 0 or args.trim_end > 0) else None
+        if clip_duration is not None:
+            log(f"    구간 제한: start={args.start_time}s ~ end={end_time:.2f}s (trim_end={args.trim_end}s)")
+        # fps 자동계산은 실제로 추출될 구간 길이(clip_duration) 기준이어야 한다.
+        # 전체 영상 길이(duration)를 기준으로 계산하면 --start-time/--trim-end로
+        # 잘라낸 짧은 구간에 맞지 않는 fps가 나와, 뷰당 프레임이 1장뿐인 등
+        # 사실상 카메라 이동(병진) 없이 회전만 있는 이미지 세트가 되어 COLMAP이
+        # 초기 이미지 쌍을 못 찾고 재구성에 실패한다.
+        effective_duration = clip_duration if clip_duration is not None else duration
+
+        if args.fps is not None:
+            fps = args.fps
+        else:
+            # 프리셋 fps를 고정으로 쓰면 영상이 길어질수록 뷰 수만큼 배로 불어나
+            # COLMAP이 감당 못할 만큼 프레임이 쏟아진다. 목표 총 프레임 수 기준으로
+            # 자동 역산해서 영상 길이와 무관하게 총량을 비슷하게 맞춘다.
+            fps = recommend_equirect_fps(effective_duration, num_views, args.target_frames)
+            log(f"    fps 미지정: 목표 총 프레임 {args.target_frames}장 기준 자동 계산(추출 구간 {effective_duration:.2f}s 기준) "
+                  f"-> fps={fps} (뷰당 약 {fps * effective_duration:.0f}장, 전체 약 {fps * effective_duration * num_views:.0f}장 예상)")
+
+        fx, fy, cx, cy = compute_pinhole_intrinsics(fov, out_w, out_h)
+        camera_model = "PINHOLE"
+        camera_params = f"{fx:.6f},{fy:.6f},{cx:.6f},{cy:.6f}"
+        log(f"    COLMAP camera_params(PINHOLE) 고정: fx=fy={fx:.2f} cx={cx:.1f} cy={cy:.1f}")
+        t0 = time.time()
+        views = [
+            (yaw, pitch, f"y{int(round(yaw)):03d}_p{int(round(pitch)):+03d}")
+            for yaw in yaw_list
+            for pitch in pitch_list
+        ]
+        try:
+            # 뷰마다 영상 전체를 새로 디코딩하지 않고, split 필터로 한 번만
+            # 디코딩해서 모든 yaw/pitch를 동시에 뽑는다 (프리셋 뷰 수만큼 N배 느려지는 것 방지).
+            log(f"[i] {len(views)}개 뷰를 단일 ffmpeg 패스로 추출 시도 (디코딩 1회)...")
+            batch_result = extract_views_batch(
+                video_path, raw_dir, views,
+                fov, fps, out_w, out_h,
+                start_time=args.start_time, clip_duration=clip_duration,
+            )
+            for _yaw, _pitch, tag in views:
+                all_raw_frames.extend(batch_result.get(tag, []))
+        except subprocess.CalledProcessError:
+            # 단일 패스가 실패하면(예: 필터그래프 제한, 메모리 부족 등) 기존 방식대로
+            # 뷰 하나씩 개별 재시도하며 추출한다. 느리지만 더 안전한 폴백.
+            log("[!] 단일 패스 추출 실패, 뷰별 개별 추출로 폴백합니다.")
+            for yaw in yaw_list:
+                for pitch in pitch_list:
+                    tag = f"y{int(round(yaw)):03d}_p{int(round(pitch)):+03d}"
+                    log(f"[i] 추출 중: yaw={yaw} pitch={pitch}")
+                    try:
+                        frames = extract_view(
+                            video_path, raw_dir, yaw, pitch,
+                            fov, fps, out_w, out_h, tag,
+                            start_time=args.start_time, clip_duration=clip_duration,
+                        )
+                        all_raw_frames.extend(frames)
+                    except subprocess.CalledProcessError:
+                        log(f"[!] yaw={yaw} pitch={pitch} 실패, 2초 대기 후 재시도")
+                        time.sleep(2)
+                        try:
+                            frames = extract_view(
+                                video_path, raw_dir, yaw, pitch,
+                                fov, fps, out_w, out_h, tag,
+                                start_time=args.start_time, clip_duration=clip_duration,
+                            )
+                            all_raw_frames.extend(frames)
+                        except subprocess.CalledProcessError:
+                            log(f"[!] 재시도도 실패: yaw={yaw} pitch={pitch} -> 스킵")
+                            failed_views.append({"yaw": yaw, "pitch": pitch})
+        log(f"[i] 총 원본 프레임 {len(all_raw_frames)}장 추출 완료 ({time.time() - t0:.1f}s)")
+
+    if filename_prefix:
+        # 여러 영상의 결과를 같은 images_dir/masks_dir에 합칠 때 파일명이 겹치지
+        # 않도록, 블러/마스킹 처리 전에 원본 프레임 파일명 앞에 접두어를 붙인다.
+        prefixed = []
+        for fp in all_raw_frames:
+            new_fp = fp.with_name(f"{filename_prefix}{fp.name}")
+            fp.rename(new_fp)
+            prefixed.append(new_fp)
+        all_raw_frames = prefixed
+
+    if args.no_mask:
+        log("[i] --no-mask: 사람 마스킹 생략, 블러 필터만 적용")
+        var_stats = report_blur_stats(all_raw_frames)
+        images_dir.mkdir(parents=True, exist_ok=True)
+        kept, skipped_blur, skipped_person = 0, 0, 0
+        metadata_frames = []
+        for fp in all_raw_frames:
+            img = cv2.imread(str(fp))
+            if img is None:
+                continue
+            var = laplacian_variance(img)
+            if var < args.blur_thresh:
+                skipped_blur += 1
+                fp.unlink(missing_ok=True)
+                continue
+            dst = images_dir / fp.name
+            shutil.move(str(fp), str(dst))
+            metadata_frames.append({"file": dst.name, "mask": None, "blur_var": round(var, 2)})
+            kept += 1
+    else:
+        var_stats = report_blur_stats(all_raw_frames)
+        log(f"[i] YOLO 모델 로드: {args.yolo_model}")
+        yolo_model = load_yolo_seg(args.yolo_model)
+        log("[i] 블러 필터 + 사람 마스킹 처리 중...")
+        kept, skipped_blur, skipped_person, metadata_frames = process_frames(
+            all_raw_frames, images_dir, masks_dir, yolo_model,
+            args.blur_thresh, args.person_skip_ratio, args.person_conf,
+        )
+
+    if kept == 0 and var_stats:
+        arr = np.array(var_stats)
+        suggested = max(1.0, float(np.percentile(arr, 20)))
+        log(f"[!] 블러 필터로 모든 프레임이 제거되었습니다 (blur_thresh={args.blur_thresh}).")
+        log(f"    --blur-thresh {suggested:.1f} 정도로 낮춰서 다시 실행해보세요.")
+
+    shutil.rmtree(raw_dir, ignore_errors=True)
+    log(f"[i] 결과: 사용 {kept}장 / 블러 제외 {skipped_blur}장 / 사람과다 제외 {skipped_person}장")
+
+    return {
+        "video_path": str(video_path),
+        "mode": mode,
+        "duration": duration,
+        "preset": args.preset if mode == "equirectangular" else None,
+        "fov": fov,
+        "fps": fps,
+        "yaw_list": yaw_list,
+        "pitch_list": pitch_list,
+        "interval": args.interval if mode == "normal" else None,
+        "camera_model": camera_model,
+        "camera_params": camera_params,
+        "failed_views": failed_views,
+        "kept": kept,
+        "skipped_blur": skipped_blur,
+        "skipped_person": skipped_person,
+        "total_raw": len(all_raw_frames),
+        "metadata_frames": metadata_frames,
+    }
+
+
 def main():
     ap = argparse.ArgumentParser(description="MP4 영상에서 COLMAP/3DGS용 이미지 추출 + 사람 마스킹")
-    ap.add_argument("--input", required=True, help="입력 MP4 영상 경로")
+    ap.add_argument("--input", required=True, nargs="+",
+                    help="입력 MP4 영상 경로. 공백으로 구분해 2개 이상 넘기면, 같은 공간을 찍은 "
+                         "여러 영상의 프레임을 하나로 합쳐 COLMAP 재구성 한 번으로 처리한다 "
+                         "(각 영상은 파일명 접두어(v0_, v1_, ...)로 구분되어 images/masks에 합쳐짐). "
+                         "여러 영상은 --mode/--preset/--fov/--resize 등 추출 옵션이 모두 동일해야 한다.")
     ap.add_argument("--output", required=True, help="출력 디렉토리")
     ap.add_argument("--mode", choices=["auto", "normal", "equirectangular"], default="auto",
                     help="auto: 영상 샘플 프레임과 해상도 기준으로 일반/360 자동 선택, normal: 일반 MP4 추출, equirectangular: 360 추출")
@@ -803,239 +1085,110 @@ def main():
                     help='Brush 실행 시 추가로 전달할 인자 문자열 (예: "--total-train-iters 30000 --export-every 5000")')
     args = ap.parse_args()
 
-    video_path = args.input
+    video_paths = args.input
     out_dir = Path(args.output)
     raw_dir = out_dir / "_raw"
     images_dir = out_dir / "images"
     masks_dir = out_dir / "masks"
     out_dir.mkdir(parents=True, exist_ok=True)
+    set_log_file(Path(video_paths[0]).resolve().parent / "log.txt")
     camera_model = None
     camera_params = None
 
     if args.start_from_brush:
-        print("[i] --start-from-brush: 이미지 추출/COLMAP 없이 기존 colmap/ 폴더로 Brush 학습만 재시작합니다.")
+        log("[i] --start-from-brush: 이미지 추출/COLMAP 없이 기존 colmap/ 폴더로 Brush 학습만 재시작합니다.")
         colmap_dir = out_dir / "colmap"
         try:
             brush_extra_args = shlex.split(args.brush_args) if args.brush_args else None
             run_brush_training(colmap_dir, brush_exe=args.brush_exe, extra_args=brush_extra_args)
-            print("[i] Brush 학습 완료")
+            log("[i] Brush 학습 완료")
         except FileNotFoundError as e:
-            print(f"[!] Brush 실행 준비 실패: {e}")
+            log(f"[!] Brush 실행 준비 실패: {e}")
             sys.exit(1)
         except subprocess.CalledProcessError as e:
-            print(f"[!] Brush 학습 실행 실패: {e}")
+            log(f"[!] Brush 학습 실행 실패: {e}")
             sys.exit(1)
-        print("[OK] 완료")
+        log("[OK] 완료")
         return
 
-    if not args.start_from_colmap and not Path(video_path).exists():
-        print(f"[!] 입력 영상을 찾을 수 없습니다: {video_path}")
-        sys.exit(1)
+    if not args.start_from_colmap:
+        missing = [vp for vp in video_paths if not Path(vp).exists()]
+        for vp in missing:
+            log(f"[!] 입력 영상을 찾을 수 없습니다: {vp}")
+        if missing:
+            sys.exit(1)
 
     if args.start_from_colmap:
-        print("[i] --start-from-colmap: 이미지 추출을 건너뛰고 COLMAP부터 시작합니다.")
+        log("[i] --start-from-colmap: 이미지 추출을 건너뛰고 COLMAP부터 시작합니다.")
         if not images_dir.exists() or not any(images_dir.iterdir()):
-            print(f"[!] {images_dir}에 이미지가 없어 COLMAP을 시작할 수 없습니다. 먼저 프레임을 추출하거나 images/ 폴더를 준비하세요.")
+            log(f"[!] {images_dir}에 이미지가 없어 COLMAP을 시작할 수 없습니다. 먼저 프레임을 추출하거나 images/ 폴더를 준비하세요.")
             sys.exit(1)
         mode = "normal"
-        duration = 0.0
-        all_raw_frames = []
         failed_views = []
-        kept, skipped_blur, skipped_person, metadata_frames = 0, 0, 0, []
-        var_stats = []
+        kept, skipped_blur, skipped_person, total_raw = 0, 0, 0, 0
+        video_results = []
     else:
-        print("[i] 영상 정보 확인 중...")
-        info = ffprobe_info(video_path)
-        width = int(info["width"])
-        height = int(info["height"])
-        duration = float(info.get("duration", 0.0))
-        aspect = float(width) / float(height)
-        print(f"    해상도: {width}x{height}  fps: {info['r_frame_rate']}  길이: {duration:.2f}s")
+        multi = len(video_paths) > 1
+        if multi:
+            log(f"[i] 영상 {len(video_paths)}편을 하나의 COLMAP 재구성으로 합쳐서 처리합니다.")
 
-        sample_info = inspect_video_sample(video_path)
-        phone_note = " (스마트폰 영상 감지)" if sample_info.get("is_smartphone") else ""
-        print(f"    샘플 프레임: {sample_info['width']}x{sample_info['height']} aspect={sample_info['aspect']:.2f}{phone_note}")
-
-        if args.mode == "auto":
-            if is_equirectangular(info, sample_info):
-                mode = "equirectangular"
-                print("[i] 자동 판별: 360°/equirectangular 영상으로 감지되어 360 추출 파이프라인을 사용합니다.")
-            else:
-                mode = "normal"
-                print("[i] 자동 판별: 일반 카메라 영상으로 감지되어 시간 간격 추출을 사용합니다.")
-        else:
-            mode = args.mode
-            print(f"[i] 강제 모드: {mode}")
-
-        raw_dir.mkdir(parents=True, exist_ok=True)
-        all_raw_frames = []
-        failed_views = []
-
-        if mode == "normal":
-            interval = args.interval if args.interval else recommend_interval(duration)
-            out_w, out_h = parse_resolution(args.resize)
-            print(f"[i] 일반 MP4 추출: interval={interval}s start={args.start_time}s trim_end={args.trim_end}s resize={out_w}x{out_h}")
-            timestamps = build_timestamps(duration, interval, args.start_time, args.trim_end)
-            print(f"[i] 타임스탬프 수: {len(timestamps)}")
-            all_raw_frames = extract_normal_frames(
-                video_path, raw_dir, timestamps, out_w, out_h,
-                keep_aspect=(args.resize_mode == "fit"),
+        video_results = []
+        for idx, vp in enumerate(video_paths):
+            prefix = f"v{idx}_" if multi else ""
+            video_raw_dir = (raw_dir / f"v{idx}") if multi else raw_dir
+            if multi:
+                log(f"[i] ({idx + 1}/{len(video_paths)}) 영상 처리 시작: {vp}")
+            video_results.append(
+                process_single_video(vp, args, video_raw_dir, images_dir, masks_dir, filename_prefix=prefix)
             )
-        else:
-            preset = SCENE_PRESETS[args.preset]
-            fov = args.fov if args.fov is not None else preset["fov"]
-            yaw_list = parse_float_list(args.yaw_list) if args.yaw_list else preset["yaw_list"]
-            pitch_list = parse_float_list(args.pitch_list) if args.pitch_list else preset["pitch_list"]
-            out_w, out_h = preset["out_w"], preset["out_h"]
-            num_views = len(yaw_list) * len(pitch_list)
-
-            computed_v_fov = compute_square_pixel_fov(fov, out_w, out_h)
-            print(f"[i] 360 추출 프리셋 '{args.preset}' 적용: yaw {len(yaw_list)} x pitch {len(pitch_list)} = {num_views}뷰")
-            print(f"    h_fov={fov}° -> 자동계산 v_fov={computed_v_fov:.2f}° (출력 {out_w}x{out_h}, 정사각형 픽셀 보장)")
-
-            if len(yaw_list) > 1:
-                # yaw_list가 360°를 균등 분할한다는 가정 하의 대략적인 추정치.
-                # (겹침 부족 = COLMAP이 인접 yaw끼리 매칭을 못 찾아 재구성이 끊길 위험)
-                yaw_step = 360.0 / len(yaw_list)
-                overlap_deg = fov - yaw_step
-                status = "양호" if overlap_deg > 15 else ("중첩 적음, 주의" if overlap_deg > 0 else "중첩 없음! 매칭 끊길 위험")
-                print(f"    yaw 간격 추정={yaw_step:.1f}° (fov={fov}° 기준) -> 인접 뷰 중첩 약 {overlap_deg:.1f}° ({status})")
-
-            end_time = max(0.0, duration - args.trim_end)
-            if args.start_time >= end_time:
-                print(f"[!] start_time({args.start_time}s) + trim_end({args.trim_end}s) >= 영상 길이({duration:.2f}s)입니다.")
-                sys.exit(1)
-            clip_duration = (end_time - args.start_time) if (args.start_time > 0 or args.trim_end > 0) else None
-            if clip_duration is not None:
-                print(f"    구간 제한: start={args.start_time}s ~ end={end_time:.2f}s (trim_end={args.trim_end}s)")
-            # fps 자동계산은 실제로 추출될 구간 길이(clip_duration) 기준이어야 한다.
-            # 전체 영상 길이(duration)를 기준으로 계산하면 --start-time/--trim-end로
-            # 잘라낸 짧은 구간에 맞지 않는 fps가 나와, 뷰당 프레임이 1장뿐인 등
-            # 사실상 카메라 이동(병진) 없이 회전만 있는 이미지 세트가 되어 COLMAP이
-            # 초기 이미지 쌍을 못 찾고 재구성에 실패한다.
-            effective_duration = clip_duration if clip_duration is not None else duration
-
-            if args.fps is not None:
-                fps = args.fps
-            else:
-                # 프리셋 fps를 고정으로 쓰면 영상이 길어질수록 뷰 수만큼 배로 불어나
-                # COLMAP이 감당 못할 만큼 프레임이 쏟아진다. 목표 총 프레임 수 기준으로
-                # 자동 역산해서 영상 길이와 무관하게 총량을 비슷하게 맞춘다.
-                fps = recommend_equirect_fps(effective_duration, num_views, args.target_frames)
-                print(f"    fps 미지정: 목표 총 프레임 {args.target_frames}장 기준 자동 계산(추출 구간 {effective_duration:.2f}s 기준) "
-                      f"-> fps={fps} (뷰당 약 {fps * effective_duration:.0f}장, 전체 약 {fps * effective_duration * num_views:.0f}장 예상)")
-
-            fx, fy, cx, cy = compute_pinhole_intrinsics(fov, out_w, out_h)
-            camera_model = "PINHOLE"
-            camera_params = f"{fx:.6f},{fy:.6f},{cx:.6f},{cy:.6f}"
-            print(f"    COLMAP camera_params(PINHOLE) 고정: fx=fy={fx:.2f} cx={cx:.1f} cy={cy:.1f}")
-            t0 = time.time()
-            views = [
-                (yaw, pitch, f"y{int(round(yaw)):03d}_p{int(round(pitch)):+03d}")
-                for yaw in yaw_list
-                for pitch in pitch_list
-            ]
-            try:
-                # 뷰마다 영상 전체를 새로 디코딩하지 않고, split 필터로 한 번만
-                # 디코딩해서 모든 yaw/pitch를 동시에 뽑는다 (프리셋 뷰 수만큼 N배 느려지는 것 방지).
-                print(f"[i] {len(views)}개 뷰를 단일 ffmpeg 패스로 추출 시도 (디코딩 1회)...")
-                batch_result = extract_views_batch(
-                    video_path, raw_dir, views,
-                    fov, fps, out_w, out_h,
-                    start_time=args.start_time, clip_duration=clip_duration,
-                )
-                for _yaw, _pitch, tag in views:
-                    all_raw_frames.extend(batch_result.get(tag, []))
-            except subprocess.CalledProcessError:
-                # 단일 패스가 실패하면(예: 필터그래프 제한, 메모리 부족 등) 기존 방식대로
-                # 뷰 하나씩 개별 재시도하며 추출한다. 느리지만 더 안전한 폴백.
-                print("[!] 단일 패스 추출 실패, 뷰별 개별 추출로 폴백합니다.")
-                for yaw in yaw_list:
-                    for pitch in pitch_list:
-                        tag = f"y{int(round(yaw)):03d}_p{int(round(pitch)):+03d}"
-                        print(f"[i] 추출 중: yaw={yaw} pitch={pitch}")
-                        try:
-                            frames = extract_view(
-                                video_path, raw_dir, yaw, pitch,
-                                fov, fps, out_w, out_h, tag,
-                                start_time=args.start_time, clip_duration=clip_duration,
-                            )
-                            all_raw_frames.extend(frames)
-                        except subprocess.CalledProcessError:
-                            print(f"[!] yaw={yaw} pitch={pitch} 실패, 2초 대기 후 재시도")
-                            time.sleep(2)
-                            try:
-                                frames = extract_view(
-                                    video_path, raw_dir, yaw, pitch,
-                                    fov, fps, out_w, out_h, tag,
-                                    start_time=args.start_time, clip_duration=clip_duration,
-                                )
-                                all_raw_frames.extend(frames)
-                            except subprocess.CalledProcessError:
-                                print(f"[!] 재시도도 실패: yaw={yaw} pitch={pitch} -> 스킵")
-                                failed_views.append({"yaw": yaw, "pitch": pitch})
-            print(f"[i] 총 원본 프레임 {len(all_raw_frames)}장 추출 완료 ({time.time() - t0:.1f}s)")
-
-        if args.no_mask:
-            print("[i] --no-mask: 사람 마스킹 생략, 블러 필터만 적용")
-            var_stats = report_blur_stats(all_raw_frames)
-            images_dir.mkdir(parents=True, exist_ok=True)
-            kept, skipped_blur, skipped_person = 0, 0, 0
-            metadata_frames = []
-            for fp in all_raw_frames:
-                img = cv2.imread(str(fp))
-                if img is None:
-                    continue
-                var = laplacian_variance(img)
-                if var < args.blur_thresh:
-                    skipped_blur += 1
-                    fp.unlink(missing_ok=True)
-                    continue
-                dst = images_dir / fp.name
-                shutil.move(str(fp), str(dst))
-                metadata_frames.append({"file": dst.name, "mask": None, "blur_var": round(var, 2)})
-                kept += 1
-            skipped_person = 0
-        else:
-            var_stats = report_blur_stats(all_raw_frames)
-            print(f"[i] YOLO 모델 로드: {args.yolo_model}")
-            yolo_model = load_yolo_seg(args.yolo_model)
-            print("[i] 블러 필터 + 사람 마스킹 처리 중...")
-            kept, skipped_blur, skipped_person, metadata_frames = process_frames(
-                all_raw_frames, images_dir, masks_dir, yolo_model,
-                args.blur_thresh, args.person_skip_ratio, args.person_conf,
-            )
-
-        if kept == 0 and var_stats:
-            arr = np.array(var_stats)
-            suggested = max(1.0, float(np.percentile(arr, 20)))
-            print(f"[!] 블러 필터로 모든 프레임이 제거되었습니다 (blur_thresh={args.blur_thresh}).")
-            print(f"    --blur-thresh {suggested:.1f} 정도로 낮춰서 다시 실행해보세요.")
-
         shutil.rmtree(raw_dir, ignore_errors=True)
 
-        print(f"[i] 결과: 사용 {kept}장 / 블러 제외 {skipped_blur}장 / 사람과다 제외 {skipped_person}장")
+        modes = {r["mode"] for r in video_results}
+        if len(modes) > 1:
+            log(f"[!] 입력 영상들의 추출 모드가 서로 다릅니다({sorted(modes)}). 하나의 COLMAP 재구성으로 "
+                "합치려면 --mode로 모든 영상에 같은 모드를 강제하고 다시 실행하세요.")
+            sys.exit(1)
+        mode = video_results[0]["mode"]
+
+        camera_params_set = {r["camera_params"] for r in video_results if r["camera_params"] is not None}
+        if len(camera_params_set) > 1:
+            log("[!] 입력 영상들의 카메라 파라미터(--fov/--preset/--resize 등)가 서로 달라 COLMAP이 전체 "
+                "이미지를 하나의 카메라로 취급할 수 없습니다. 모든 영상에 같은 추출 옵션을 사용하세요.")
+            sys.exit(1)
+
+        camera_model = video_results[0]["camera_model"]
+        camera_params = video_results[0]["camera_params"]
+        failed_views = [v for r in video_results for v in r["failed_views"]]
+        kept = sum(r["kept"] for r in video_results)
+        skipped_blur = sum(r["skipped_blur"] for r in video_results)
+        skipped_person = sum(r["skipped_person"] for r in video_results)
+        total_raw = sum(r["total_raw"] for r in video_results)
+
+        if multi:
+            log(f"[i] 전체 결과({len(video_paths)}개 영상 합산): 사용 {kept}장 / 블러 제외 {skipped_blur}장 / "
+                f"사람과다 제외 {skipped_person}장")
 
     metadata = {
-        "source_video": str(video_path),
+        "source_videos": [str(vp) for vp in video_paths],
         "mode": mode,
-        "preset": args.preset if mode == "equirectangular" else None,
-        "normal_params": {
-            "interval": args.interval,
-            "start_time": args.start_time,
-            "trim_end": args.trim_end,
-            "resize": args.resize,
-            "resize_mode": args.resize_mode,
-        } if mode == "normal" else None,
-        "equirect_params": {
-            "fov": fov,
-            "fps": fps,
-            "yaw_list": yaw_list,
-            "pitch_list": pitch_list,
-            "target_frames": args.target_frames,
-            "start_time": args.start_time,
-            "trim_end": args.trim_end,
-        } if mode == "equirectangular" else None,
+        "videos": [
+            {
+                "video_path": r["video_path"],
+                "duration": r["duration"],
+                "preset": r["preset"],
+                "fov": r["fov"],
+                "fps": r["fps"],
+                "yaw_list": r["yaw_list"],
+                "pitch_list": r["pitch_list"],
+                "interval": r["interval"],
+                "kept": r["kept"],
+                "skipped_blur": r["skipped_blur"],
+                "skipped_person": r["skipped_person"],
+                "total_raw": r["total_raw"],
+                "failed_views": r["failed_views"],
+            }
+            for r in video_results
+        ],
         "masking_enabled": not args.no_mask,
         "blur_thresh": args.blur_thresh,
         "person_skip_ratio": args.person_skip_ratio,
@@ -1044,25 +1197,36 @@ def main():
             "kept": kept,
             "skipped_blur": skipped_blur,
             "skipped_person": skipped_person,
-            "total_raw": len(all_raw_frames),
+            "total_raw": total_raw,
         },
         "images_dir": str(images_dir),
         "masks_dir": str(masks_dir) if not args.no_mask else None,
-        "frames": metadata_frames,
+        "frames": [f for r in video_results for f in r["metadata_frames"]],
     }
     meta_path = out_dir / "gs_metadata.json"
     with open(meta_path, "w", encoding="utf-8") as f:
         json.dump(metadata, f, ensure_ascii=False, indent=2)
-    print(f"[i] 메타데이터 저장: {meta_path}")
+    log(f"[i] 메타데이터 저장: {meta_path}")
 
     if args.run_colmap or args.start_from_colmap:
         db_path = args.colmap_db or str(out_dir / "database.db")
         matcher = args.colmap_matcher
         if matcher is None:
-            # equirectangular는 서로 다른 yaw/pitch 뷰가 파일명 정렬 순서상 번갈아 오므로
-            # sequential matcher로는 실제로 겹치는 뷰끼리 매칭되지 않아 재구성이 조각날 수 있다.
-            matcher = "exhaustive" if mode == "equirectangular" else "sequential"
-            print(f"[i] --colmap-matcher 미지정: 모드({mode})에 따라 '{matcher}' 자동 선택")
+            if len(video_paths) > 1:
+                # sequential matcher는 "파일명 순서 = 실제 촬영 경로 순서"라는 가정에
+                # 의존한다. 영상 여러 개를 합치면 colmap_images_dir에서 v0_*가 v1_*보다
+                # 앞에 오도록 정렬되는데, 두 영상은 서로 다른 촬영 경로이므로 그 경계에서
+                # sequential matcher가 겹치는 프레임끼리 전혀 매칭을 시도하지 않는다.
+                # 그 결과 영상별로 재구성이 쪼개져 버리므로, 모든 쌍을 확인하는
+                # exhaustive matcher를 강제한다.
+                matcher = "exhaustive"
+                log(f"[i] --colmap-matcher 미지정: 영상 {len(video_paths)}개를 합치는 경우 "
+                    "sequential matcher는 영상 경계에서 매칭이 끊기므로 'exhaustive' 자동 선택")
+            else:
+                # equirectangular는 서로 다른 yaw/pitch 뷰가 파일명 정렬 순서상 번갈아 오므로
+                # sequential matcher로는 실제로 겹치는 뷰끼리 매칭되지 않아 재구성이 조각날 수 있다.
+                matcher = "exhaustive" if mode == "equirectangular" else "sequential"
+                log(f"[i] --colmap-matcher 미지정: 모드({mode})에 따라 '{matcher}' 자동 선택")
         try:
             colmap_result = run_colmap_pipeline(
                 out_dir,
@@ -1075,7 +1239,7 @@ def main():
                 camera_model=camera_model,
                 camera_params=camera_params,
             )
-            print(f"[i] COLMAP 파이프라인 완료. 결과: {colmap_result['colmap_dir']}")
+            log(f"[i] COLMAP 파이프라인 완료. 결과: {colmap_result['colmap_dir']}")
             if args.run_brush:
                 try:
                     brush_extra_args = shlex.split(args.brush_args) if args.brush_args else None
@@ -1083,17 +1247,17 @@ def main():
                     # 넘겨야 Brush가 COLMAP 포인트클라우드로 가우시안을 초기화한다.
                     # transforms.json만 쓰면 랜덤 초기화로 시작해 품질이 크게 떨어진다.
                     run_brush_training(Path(colmap_result["colmap_dir"]), brush_exe=args.brush_exe, extra_args=brush_extra_args)
-                    print("[i] Brush 학습 완료")
+                    log("[i] Brush 학습 완료")
                 except FileNotFoundError as e:
-                    print(f"[!] Brush 실행 준비 실패: {e}")
+                    log(f"[!] Brush 실행 준비 실패: {e}")
                 except subprocess.CalledProcessError as e:
-                    print(f"[!] Brush 학습 실행 실패: {e}")
+                    log(f"[!] Brush 학습 실행 실패: {e}")
         except FileNotFoundError:
-            print("[!] colmap 실행파일을 찾을 수 없습니다. PATH에 colmap이 등록되어 있는지 확인하세요.")
+            log("[!] colmap 실행파일을 찾을 수 없습니다. PATH에 colmap이 등록되어 있는지 확인하세요.")
         except subprocess.CalledProcessError as e:
-            print(f"[!] COLMAP 실행 실패: {e}")
+            log(f"[!] COLMAP 실행 실패: {e}")
 
-    print("[OK] 완료")
+    log("[OK] 완료")
 
 
 if __name__ == "__main__":
