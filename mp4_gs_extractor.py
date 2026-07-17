@@ -39,6 +39,7 @@ import shutil
 import tempfile
 import time
 from pathlib import Path
+from typing import Optional
 
 try:
     import cv2  # type: ignore[import]
@@ -123,10 +124,53 @@ SCENE_PRESETS = {
 PERSON_CLASS_ID = 0
 
 
+def resolve_command(cmd):
+    if not isinstance(cmd, (list, tuple)) or not cmd:
+        return cmd
+
+    tool = cmd[0]
+    if tool in {"ffmpeg", "ffprobe", "colmap"}:
+        candidates = [tool]
+        if os.name == "nt":
+            candidates.extend([f"{tool}.exe", f"{tool}.bat"])
+        else:
+            candidates.extend([f"{tool}.exe"])
+        for candidate in candidates:
+            resolved = shutil.which(candidate)
+            if resolved:
+                return [resolved, *cmd[1:]]
+    elif tool in {"brush", "brush.exe"}:
+        candidates = [tool]
+        if os.name == "nt":
+            candidates.extend(["brush.exe", "brush"])
+        else:
+            candidates.extend(["brush", "brush.exe"])
+        for candidate in candidates:
+            resolved = shutil.which(candidate)
+            if resolved:
+                return [resolved, *cmd[1:]]
+    return list(cmd)
+
+
+def resolve_executable(executable: str) -> str:
+    if os.path.isabs(executable) or executable.startswith(".") or "/" in executable or "\\" in executable:
+        return executable
+    resolved = shutil.which(executable)
+    if resolved:
+        return resolved
+    if os.name == "nt" and not executable.lower().endswith(".exe"):
+        alt = f"{executable}.exe"
+        resolved_alt = shutil.which(alt)
+        if resolved_alt:
+            return resolved_alt
+    return executable
+
+
 def run(cmd, **kwargs):
-    log(f"[cmd] {' '.join(str(c) for c in cmd)}")
+    resolved_cmd = resolve_command(cmd)
+    log(f"[cmd] {' '.join(str(c) for c in resolved_cmd)}")
     try:
-        return subprocess.run(cmd, check=True, **kwargs)
+        return subprocess.run(resolved_cmd, check=True, **kwargs)
     except subprocess.CalledProcessError as e:
         if e.stdout:
             log("---- stdout ----")
@@ -205,7 +249,7 @@ def inspect_video_sample(video_path: str) -> dict:
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
-def is_equirectangular(stream: dict, sample_info: dict | None = None) -> bool:
+def is_equirectangular(stream: dict, sample_info: Optional[dict] = None) -> bool:
     width = int(stream["width"])
     height = int(stream["height"])
     aspect = float(width) / float(height)
@@ -787,7 +831,7 @@ def run_colmap_pipeline(out_dir: Path, images_dir: Path, masks_dir: Path, db_pat
     }
 
 
-def run_brush_training(dataset_dir: Path, brush_exe: str = "brush.exe", extra_args=None):
+def run_brush_training(dataset_dir: Path, brush_exe: str = None, extra_args=None):
     # Brush는 콜맵 스파스 포인트클라우드(sparse/*/points3D.*)가 있으면 거기서
     # 가우시안을 초기화하고, 없으면(transforms.json만 있는 nerfstudio 포맷)
     # 랜덤 초기화로 시작한다. 랜덤 초기화는 품질이 크게 떨어지므로, COLMAP
@@ -802,7 +846,9 @@ def run_brush_training(dataset_dir: Path, brush_exe: str = "brush.exe", extra_ar
     if not has_colmap_points:
         log("[!] sparse/*/points3D.*가 없어 포인트클라우드 초기화 없이(랜덤 초기화) 학습합니다. "
               "COLMAP 결과 폴더(images/ + sparse/0/)를 넘기면 품질이 크게 좋아집니다.")
-    cmd = [brush_exe, str(dataset_dir)]
+    brush_name = brush_exe or ("brush.exe" if os.name == "nt" else "brush")
+    resolved_brush = resolve_executable(brush_name)
+    cmd = [resolved_brush, str(dataset_dir)]
     if extra_args:
         cmd.extend(extra_args)
     run(cmd)
@@ -1079,8 +1125,8 @@ def main():
     ap.add_argument("--prepare-brush", action="store_true", help="COLMAP 이후 Brush 학습용 transforms.json 생성")
     ap.add_argument("--run-brush", action="store_true",
                     help="COLMAP 완료 후 Brush 학습까지 자동 실행 (--prepare-brush 자동 적용)")
-    ap.add_argument("--brush-exe", default="brush.exe",
-                    help="Brush 학습 실행파일 경로/이름 (기본: brush.exe, PATH에 등록되어 있어야 함)")
+    ap.add_argument("--brush-exe", default=None,
+                    help="Brush 학습 실행파일 경로/이름 (기본: Windows는 brush.exe, macOS는 brush, PATH에 등록되어 있어야 함)")
     ap.add_argument("--brush-args", default=None,
                     help='Brush 실행 시 추가로 전달할 인자 문자열 (예: "--total-train-iters 30000 --export-every 5000")')
     args = ap.parse_args()
