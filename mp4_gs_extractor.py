@@ -91,15 +91,16 @@ SCENE_PRESETS = {
         "yaw_list": [0, 60, 120, 180, 240, 300],
         "pitch_list": [-10, 10],
         "fov": 100,
-        "fps": 2,
         "out_w": 1920,
         "out_h": 1080,
     },
     "indoor_dense": {
         "yaw_list": [0, 45, 90, 135, 180, 225, 270, 315],
         "pitch_list": [-15, 0, 15],
-        "fov": 90,
-        "fps": 3,
+        # yaw 8뷰(간격 45°) 기준 fov=90이면 인접 뷰 중첩이 45°뿐이라 매칭이 끊기기
+        # 쉽다. fov=100으로 겹침을 65°까지 늘리면 COLMAP 등록률이 크게 개선된다
+        # (실측: 같은 조건에서 fov=90 대비 fov=100이 등록률 92%->98.6%).
+        "fov": 100,
         "out_w": 1920,
         "out_h": 1080,
     },
@@ -107,7 +108,6 @@ SCENE_PRESETS = {
         "yaw_list": [0, 45, 90, 135, 180, 225, 270, 315],
         "pitch_list": [-20, 0],
         "fov": 80,
-        "fps": 4,
         "out_w": 1920,
         "out_h": 1080,
     },
@@ -115,13 +115,19 @@ SCENE_PRESETS = {
         "yaw_list": [0, 90, 180, 270],
         "pitch_list": [0],
         "fov": 100,
-        "fps": 1,
         "out_w": 1280,
         "out_h": 720,
     },
 }
 
 PERSON_CLASS_ID = 0
+
+# Brush의 --growth-stop-iter 기본값(15000)은 --total-train-iters를 늘려도 그대로라서,
+# 학습을 오래 시켜도 15000 iter 이후로는 스플랫 수가 늘지 않고 기존 스플랫만 다듬는다
+# (실측: --total-train-iters 60000에 이 값을 같이 안 올렸더니 15000 이후 77.9만개에서
+# 고정, 45000으로 맞춰주자 159만개까지 계속 증식). --total-train-iters와 항상 같이
+# 비례해서 올려야 늘어난 학습 시간이 실제로 디테일 증가로 이어진다.
+DEFAULT_BRUSH_ARGS = "--total-train-iters 60000 --growth-stop-iter 45000 --max-splats 20000000"
 
 
 def resolve_command(cmd):
@@ -181,6 +187,27 @@ def run(cmd, **kwargs):
         raise
 
 
+def run_streamed(cmd):
+    """run()과 달리 출력을 다 모았다가 실패했을 때만 보여주지 않고, 실행되는 동안
+    한 줄씩 콘솔에 실시간으로 내보내는 동시에 로그 파일에도 남긴다. COLMAP
+    feature_extractor/mapper나 Brush 학습처럼 오래 걸리는 명령에 capture_output=True를
+    쓰면 끝날 때까지 진행 상황이 안 보이고, 반대로 capture 없이 run()을 쓰면(기존 동작)
+    실패해도 원인이 로그 파일에 전혀 안 남고 콘솔에만 찍히고 사라진다. 두 요구사항을
+    동시에 만족시키려고 Popen으로 직접 라인 단위 스트리밍한다."""
+    resolved_cmd = resolve_command(cmd)
+    log(f"[cmd] {' '.join(str(c) for c in resolved_cmd)}")
+    process = subprocess.Popen(
+        resolved_cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        text=True, bufsize=1,
+    )
+    assert process.stdout is not None
+    for line in process.stdout:
+        log(line.rstrip("\n"))
+    returncode = process.wait()
+    if returncode != 0:
+        raise subprocess.CalledProcessError(returncode, resolved_cmd)
+
+
 def ffprobe_info(video_path: str) -> dict:
     cmd = [
         "ffprobe", "-v", "error",
@@ -189,7 +216,7 @@ def ffprobe_info(video_path: str) -> dict:
         "-of", "json",
         video_path,
     ]
-    out = subprocess.run(cmd, capture_output=True, text=True, check=True)
+    out = run(cmd, capture_output=True, text=True)
     data = json.loads(out.stdout)
     stream = data["streams"][0]
     # 가변 프레임레이트 등 일부 컨테이너는 stream에 duration이 없고 format에만 있음.
@@ -279,18 +306,6 @@ def recommend_interval(duration: float) -> float:
     target = 120
     interval = duration / target
     return round(max(0.5, min(3.0, interval)), 2)
-
-
-def recommend_equirect_fps(duration: float, num_views: int, target_total_frames: int, min_fps: float = 0.1, max_fps: float = 5.0) -> float:
-    """normal 모드의 recommend_interval과 같은 목적: 영상 길이가 늘어나도
-    (yaw/pitch 뷰 수 x fps x duration)로 정해지는 전체 프레임 수가 무한정 커지지
-    않도록, 목표 총 프레임 수(target_total_frames)에 맞춰 fps를 역산한다.
-    프리셋의 fps를 고정값으로 그대로 쓰면 긴 영상에서 뷰 수만큼 배로 불어나
-    COLMAP이 감당하기 어려울 만큼 이미지가 쏟아진다."""
-    if duration <= 0 or num_views <= 0:
-        return max_fps
-    fps = (target_total_frames / num_views) / duration
-    return round(max(min_fps, min(max_fps, fps)), 3)
 
 
 def parse_float_list(text: str):
@@ -574,10 +589,9 @@ def prepare_colmap_inputs(images_dir: Path, masks_dir: Path, colmap_images_dir: 
 
 
 def count_registered_images(model_dir: Path) -> int:
-    result = subprocess.run(
-        ["colmap", "model_analyzer", "--path", str(model_dir)],
-        capture_output=True, text=True,
-    )
+    cmd = resolve_command(["colmap", "model_analyzer", "--path", str(model_dir)])
+    log(f"[cmd] {' '.join(str(c) for c in cmd)}")
+    result = subprocess.run(cmd, capture_output=True, text=True)
     for line in (result.stdout + result.stderr).splitlines():
         if "Registered images:" in line:
             try:
@@ -627,12 +641,13 @@ def merge_sparse_models(sparse_dir: Path, total_images: int = None) -> Path:
     for i, other in enumerate(ordered[1:]):
         merge_out = work_dir / f"attempt_{i}"
         merge_out.mkdir(parents=True, exist_ok=True)  # model_merger는 출력 폴더를 자동 생성하지 않음
-        result = subprocess.run(
-            ["colmap", "model_merger",
-             "--input_path1", str(current), "--input_path2", str(other),
-             "--output_path", str(merge_out)],
-            capture_output=True, text=True,
-        )
+        merger_cmd = resolve_command([
+            "colmap", "model_merger",
+            "--input_path1", str(current), "--input_path2", str(other),
+            "--output_path", str(merge_out),
+        ])
+        log(f"[cmd] {' '.join(str(c) for c in merger_cmd)}")
+        result = subprocess.run(merger_cmd, capture_output=True, text=True)
         # model_merger는 두 모델 간 공통 등록 이미지가 부족해 정합(alignment)에
         # 실패해도 exit code 0을 반환하고 출력 폴더에 뭔가를 남길 수 있다. 그래서
         # returncode/출력 존재 여부만으로는 실제 병합 성공 여부를 판단할 수 없다.
@@ -705,7 +720,7 @@ def run_colmap_pipeline(out_dir: Path, images_dir: Path, masks_dir: Path, db_pat
         feature_cmd += ["--ImageReader.camera_model", camera_model, "--ImageReader.camera_params", camera_params]
     if masks_dir.exists() and any(colmap_masks_dir.iterdir()):
         feature_cmd += ["--ImageReader.mask_path", str(colmap_masks_dir)]
-    run(feature_cmd)
+    run_streamed(feature_cmd)
 
     if matcher == "vocab_tree":
         match_cmd = [
@@ -723,7 +738,7 @@ def run_colmap_pipeline(out_dir: Path, images_dir: Path, masks_dir: Path, db_pat
             f"{matcher}_matcher",
             "--database_path", db_path,
         ]
-    run(match_cmd)
+    run_streamed(match_cmd)
 
     mapper_cmd = [
         "colmap", "mapper",
@@ -731,7 +746,13 @@ def run_colmap_pipeline(out_dir: Path, images_dir: Path, masks_dir: Path, db_pat
         "--image_path", str(colmap_images_dir),
         "--output_path", str(sparse_dir),
     ]
-    run(mapper_cmd)
+    if camera_model and camera_params:
+        # equirect 추출은 h_fov/out_w/out_h로 fx=fy를 기하학적으로 정확히 계산해서
+        # 넘긴 값이다(compute_pinhole_intrinsics). BA가 이 값을 추정치로 여기고
+        # 다시 조정하게 두면(기본 동작) 텍스처가 반복적인 장면(잔디/코스 등)에서
+        # 오히려 잘못된 방향으로 흔들릴 수 있으므로, 이미 정확한 값은 고정시킨다.
+        mapper_cmd += ["--Mapper.ba_refine_focal_length", "0", "--Mapper.ba_refine_extra_params", "0"]
+    run_streamed(mapper_cmd)
 
     total_images = sum(1 for p in colmap_images_dir.iterdir() if p.is_file())
     best_model_dir = merge_sparse_models(sparse_dir, total_images=total_images)
@@ -743,7 +764,7 @@ def run_colmap_pipeline(out_dir: Path, images_dir: Path, masks_dir: Path, db_pat
         "--output_path", str(export_dir),
         "--output_type", "TXT",
     ]
-    run(converter_cmd)
+    run_streamed(converter_cmd)
 
     if prepare_brush:
         brush_images_dir = brush_dir / "images"
@@ -892,7 +913,7 @@ def process_single_video(video_path: str, args, raw_dir: Path, images_dir: Path,
 
     if mode == "normal":
         interval = args.interval if args.interval else recommend_interval(duration)
-        out_w, out_h = parse_resolution(args.resize)
+        out_w, out_h = parse_resolution(args.resize or "1920x1080")
         log(f"[i] 일반 MP4 추출: interval={interval}s start={args.start_time}s trim_end={args.trim_end}s resize={out_w}x{out_h}")
         timestamps = build_timestamps(duration, interval, args.start_time, args.trim_end)
         log(f"[i] 타임스탬프 수: {len(timestamps)}")
@@ -905,7 +926,11 @@ def process_single_video(video_path: str, args, raw_dir: Path, images_dir: Path,
         fov = args.fov if args.fov is not None else preset["fov"]
         yaw_list = parse_float_list(args.yaw_list) if args.yaw_list else preset["yaw_list"]
         pitch_list = parse_float_list(args.pitch_list) if args.pitch_list else preset["pitch_list"]
-        out_w, out_h = preset["out_w"], preset["out_h"]
+        if args.resize:
+            out_w, out_h = parse_resolution(args.resize)
+            log(f"[i] --resize 지정: 프리셋 해상도 대신 {out_w}x{out_h}로 뷰를 추출합니다.")
+        else:
+            out_w, out_h = preset["out_w"], preset["out_h"]
         num_views = len(yaw_list) * len(pitch_list)
 
         computed_v_fov = compute_square_pixel_fov(fov, out_w, out_h)
@@ -936,13 +961,28 @@ def process_single_video(video_path: str, args, raw_dir: Path, images_dir: Path,
 
         if args.fps is not None:
             fps = args.fps
+            log(f"    fps 직접 지정: fps={fps}")
         else:
-            # 프리셋 fps를 고정으로 쓰면 영상이 길어질수록 뷰 수만큼 배로 불어나
-            # COLMAP이 감당 못할 만큼 프레임이 쏟아진다. 목표 총 프레임 수 기준으로
-            # 자동 역산해서 영상 길이와 무관하게 총량을 비슷하게 맞춘다.
-            fps = recommend_equirect_fps(effective_duration, num_views, args.target_frames)
-            log(f"    fps 미지정: 목표 총 프레임 {args.target_frames}장 기준 자동 계산(추출 구간 {effective_duration:.2f}s 기준) "
+            # 목표 총 프레임 수를 정해두고 거꾸로 fps를 역산하면(예전 방식), 영상이
+            # 길어질수록 뷰당 간격이 넓어져서 같은 방향(yaw/pitch)을 찍은 인접 프레임
+            # 사이에 카메라가 너무 많이 이동해버려 겹치는 영역이 부족해지고, 그 결과
+            # COLMAP이 초기 이미지 쌍을 못 찾아 재구성이 조각나거나 등록률이 낮아진다
+            # (예: 320초 영상을 150장 목표로 뽑으면 뷰당 간격이 약 50초씩 벌어짐).
+            # 대신 --interval(초 단위 샘플링 간격)을 직접 기준으로 삼으면, 영상 길이와
+            # 무관하게 인접 프레임 사이 카메라 이동량(=간격)이 항상 일정하게 유지되어
+            # 중첩률이 안정적이다. 총 프레임 수는 그 대가로 영상 길이에 비례해 늘어나므로,
+            # 긴 영상은 --interval을 더 크게 주거나 --start-time/--trim-end로 구간을
+            # 좁혀서 사용자가 직접 조절해야 한다.
+            interval = args.interval if args.interval else 1.0
+            fps = round(1.0 / interval, 4)
+            log(f"    fps 미지정: --interval={interval}s 기준 자동 계산(추출 구간 {effective_duration:.2f}s 기준) "
                   f"-> fps={fps} (뷰당 약 {fps * effective_duration:.0f}장, 전체 약 {fps * effective_duration * num_views:.0f}장 예상)")
+
+        total_estimate = fps * effective_duration * num_views
+        if total_estimate > 500:
+            log(f"[!] 예상 총 프레임 수가 {total_estimate:.0f}장으로 많습니다. COLMAP exhaustive_matcher가 "
+                "느려지거나 감당 못 할 수 있습니다. --interval을 더 크게 주거나 --start-time/--trim-end로 "
+                "구간을 좁혀서 다시 시도해보세요.")
 
         fx, fy, cx, cy = compute_pinhole_intrinsics(fov, out_w, out_h)
         camera_model = "PINHOLE"
@@ -1086,18 +1126,22 @@ def main():
     ap.add_argument("--pitch-list", default=None,
                     help="쉼표로 구분된 pitch 각도 목록으로 프리셋 pitch_list를 덮어씀 (예: '-10,10')")
     ap.add_argument("--fps", type=float, default=None,
-                    help="360 추출 fps 직접 지정(뷰 하나당). 지정하지 않으면 --target-frames와 "
-                         "영상 길이/뷰 수 기준으로 자동 계산된다(긴 영상에서 프레임이 과도하게 "
-                         "많아지는 것을 방지). 지정 시 자동 계산을 건너뛰고 그대로 사용.")
-    ap.add_argument("--target-frames", type=int, default=150,
-                    help="--fps 미지정 시 목표로 하는 전체(모든 yaw/pitch 뷰 합산) 원본 프레임 수. "
-                         "기본 150장 안팎이면 COLMAP이 빠르고 안정적으로 재구성 가능. 장면이 "
-                         "복잡하면 200~300 정도로 늘려도 됨.")
+                    help="360 추출 fps 직접 지정(뷰 하나당). 지정하지 않으면 --interval 기준으로 "
+                         "자동 계산된다(fps=1/interval). 지정 시 자동 계산을 건너뛰고 그대로 사용.")
     ap.add_argument("--interval", type=float, default=None,
-                    help="일반 MP4 추출 간격(초). 지정하지 않으면 권장값 사용")
+                    help="프레임 추출 간격(초). normal 모드는 이 간격으로 직접 프레임을 추출하고(미지정 "
+                         "시 영상 길이 기준 권장값 사용), equirectangular 모드는 뷰 하나당 fps=1/interval로 "
+                         "환산해 사용한다(미지정 시 1초, 즉 fps=1). 간격이 좁을수록(=fps가 높을수록) 인접 "
+                         "프레임끼리 겹치는 영역이 늘어나 COLMAP 매칭이 안정적이지만, 영상이 길면 총 프레임 "
+                         "수가 그만큼 늘어나 COLMAP이 느려질 수 있으니 긴 영상은 값을 크게 주는 게 좋다.")
     ap.add_argument("--start-time", type=float, default=0.0, help="추출 시작 시간(초)")
     ap.add_argument("--trim-end", type=float, default=0.0, help="끝에서 제외할 시간(초)")
-    ap.add_argument("--resize", default="1920x1080", help="출력 프레임 크기(WxH). --resize-mode fit이면 가로(W) 기준으로만 적용되고 세로는 비율유지 자동계산됨")
+    ap.add_argument("--resize", default=None,
+                    help="출력 프레임 크기(WxH). 미지정 시 normal 모드는 1920x1080, equirectangular 모드는 "
+                         "프리셋의 out_w/out_h를 사용. --resize-mode fit이면 가로(W) 기준으로만 적용되고 "
+                         "세로는 비율유지 자동계산됨(normal 모드에만 적용). equirectangular 모드에서 지정하면 "
+                         "프리셋 해상도를 덮어써서 뷰당 더 높은 해상도로 추출할 수 있다(디테일/매칭 품질 향상, "
+                         "대신 처리 시간 증가).")
     ap.add_argument("--resize-mode", choices=["fit", "stretch"], default="fit",
                     help="fit(기본값): 비율 유지하며 스케일(왜곡 없음, 권장). stretch: 비율 무시하고 W x H로 강제(왜곡 발생 가능, 기존 동작)")
     ap.add_argument("--blur-thresh", type=float, default=15.0,
@@ -1127,8 +1171,12 @@ def main():
                     help="COLMAP 완료 후 Brush 학습까지 자동 실행 (--prepare-brush 자동 적용)")
     ap.add_argument("--brush-exe", default=None,
                     help="Brush 학습 실행파일 경로/이름 (기본: Windows는 brush.exe, macOS는 brush, PATH에 등록되어 있어야 함)")
-    ap.add_argument("--brush-args", default=None,
-                    help='Brush 실행 시 추가로 전달할 인자 문자열 (예: "--total-train-iters 30000 --export-every 5000")')
+    ap.add_argument("--brush-args", default=DEFAULT_BRUSH_ARGS,
+                    help='Brush 실행 시 전달할 인자 문자열 (미지정 시 기본값 적용: '
+                         f'"{DEFAULT_BRUSH_ARGS}" - total-train-iters를 늘린 만큼 '
+                         "growth-stop-iter도 비례해서 올려야 학습 후반부에도 스플랫이 계속 "
+                         "늘어난다). 직접 지정하면 이 기본값 전체를 대체하므로, total-train-iters만 "
+                         "바꾸고 싶어도 growth-stop-iter를 함께 명시해야 한다.")
     args = ap.parse_args()
 
     video_paths = args.input
@@ -1137,9 +1185,10 @@ def main():
     images_dir = out_dir / "images"
     masks_dir = out_dir / "masks"
     out_dir.mkdir(parents=True, exist_ok=True)
-    set_log_file(Path(video_paths[0]).resolve().parent / "log.txt")
+    set_log_file(out_dir / "log.txt")
     camera_model = None
     camera_params = None
+    prev_meta = {}
 
     if args.start_from_brush:
         log("[i] --start-from-brush: 이미지 추출/COLMAP 없이 기존 colmap/ 폴더로 Brush 학습만 재시작합니다.")
@@ -1170,6 +1219,27 @@ def main():
             log(f"[!] {images_dir}에 이미지가 없어 COLMAP을 시작할 수 없습니다. 먼저 프레임을 추출하거나 images/ 폴더를 준비하세요.")
             sys.exit(1)
         mode = "normal"
+        prev_meta_path = out_dir / "gs_metadata.json"
+        if prev_meta_path.exists():
+            # images/를 만든 원래 실행(예: equirectangular 360 추출)의 mode와
+            # camera_model/camera_params를 복원한다. 이걸 안 하고 mode="normal"로
+            # 고정해두면, 원래 equirectangular였던 images/에 대해 matcher가
+            # sequential로 잘못 선택되고(아래 --colmap-matcher 자동 선택 로직 참고)
+            # COLMAP이 계산해둔 정확한 PINHOLE 초점거리도 못 넘겨줘서 재구성 품질이
+            # 떨어진다.
+            try:
+                with open(prev_meta_path, "r", encoding="utf-8") as f:
+                    prev_meta = json.load(f)
+                mode = prev_meta.get("mode") or mode
+                camera_model = prev_meta.get("camera_model")
+                camera_params = prev_meta.get("camera_params")
+                log(f"[i] 기존 gs_metadata.json에서 추출 모드 복원: mode={mode}"
+                    + (f" camera_model={camera_model} camera_params={camera_params}" if camera_model else ""))
+            except (OSError, json.JSONDecodeError) as e:
+                log(f"[!] 기존 gs_metadata.json을 읽지 못했습니다({e}). mode=normal로 진행합니다.")
+        else:
+            log("[!] 기존 gs_metadata.json이 없어 원래 추출 모드를 알 수 없습니다. mode=normal로 가정합니다 "
+                "(원래 equirectangular로 추출한 images/였다면 --colmap-matcher exhaustive를 직접 지정하세요).")
         failed_views = []
         kept, skipped_blur, skipped_person, total_raw = 0, 0, 0, 0
         video_results = []
@@ -1214,10 +1284,14 @@ def main():
             log(f"[i] 전체 결과({len(video_paths)}개 영상 합산): 사용 {kept}장 / 블러 제외 {skipped_blur}장 / "
                 f"사람과다 제외 {skipped_person}장")
 
-    metadata = {
-        "source_videos": [str(vp) for vp in video_paths],
-        "mode": mode,
-        "videos": [
+    if args.start_from_colmap:
+        # 이 경로는 video_results가 비어 있어서(이미지 추출을 안 함) "videos"/"frames"를
+        # 새로 만들 수 없다. 원래 추출을 수행했던 이전 gs_metadata.json의 값을 그대로
+        # 이어받아서, --start-from-colmap을 실행할 때마다 그 정보가 사라지지 않게 한다.
+        videos_field = prev_meta.get("videos", [])
+        frames_field = prev_meta.get("frames", [])
+    else:
+        videos_field = [
             {
                 "video_path": r["video_path"],
                 "duration": r["duration"],
@@ -1234,7 +1308,15 @@ def main():
                 "failed_views": r["failed_views"],
             }
             for r in video_results
-        ],
+        ]
+        frames_field = [f for r in video_results for f in r["metadata_frames"]]
+
+    metadata = {
+        "source_videos": [str(vp) for vp in video_paths],
+        "mode": mode,
+        "camera_model": camera_model,
+        "camera_params": camera_params,
+        "videos": videos_field,
         "masking_enabled": not args.no_mask,
         "blur_thresh": args.blur_thresh,
         "person_skip_ratio": args.person_skip_ratio,
@@ -1247,7 +1329,7 @@ def main():
         },
         "images_dir": str(images_dir),
         "masks_dir": str(masks_dir) if not args.no_mask else None,
-        "frames": [f for r in video_results for f in r["metadata_frames"]],
+        "frames": frames_field,
     }
     meta_path = out_dir / "gs_metadata.json"
     with open(meta_path, "w", encoding="utf-8") as f:
